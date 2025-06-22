@@ -1,0 +1,94 @@
+{
+  "builder_name": "csv",
+  "citation": "",
+  "config_name": "default",
+  "dataset_name": "emosign",
+  "dataset_size": 81313,
+  "description": "",
+  "download_checksums": {
+    "hf://datasets/catfang/emosign@b52ae00b31cb51eddae73bdc1799b440a169729e/emosign_dataset.csv": {
+      "num_bytes": 67018,
+      "checksum": null
+    }
+  },
+  "download_size": 67018,
+  "features": {
+    "video_name": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "Sentiment": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "joy": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "excited": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "surprise_pos": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "surprise_neg": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "worry": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "sadness": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "fear": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "disgust": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "frustration": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "anger": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "Reasoning_1": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "Reasoning_2": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "Reasoning_3": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": "",
+  "size_in_bytes": 148331,
+  "splits": {
+    "train": {
+      "name": "train",
+      "num_bytes": 81313,
+      "num_examples": 200,
+      "dataset_name": "emosign"
+    }
+  },
+  "version": {
+    "version_str": "0.0.0",
+    "major": 0,
+    "minor": 0,
+    "patch": 0
+  }
+}
