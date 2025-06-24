@@ -85,6 +85,7 @@ def process_video(video_path, output_path):
             # Se il viso è rilevato, salviamo i landmark
             if results.multi_face_landmarks:
                 for face_landmarks in results.multi_face_landmarks:
+                    # Estrai i landmark e normalizza le coordinate
                     landmarks = [
                         {
                             "x": landmark.x,  # Normalizzato da 0 a 1
