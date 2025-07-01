@@ -1,5 +1,6 @@
 __pycache__/
 .venv
+raw/
 
 # VS Code
 .vscode/
