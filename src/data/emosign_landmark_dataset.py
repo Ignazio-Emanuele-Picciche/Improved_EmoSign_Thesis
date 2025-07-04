@@ -62,23 +62,22 @@ class LandmarkDataset(Dataset):
         # 2. Converte l'etichetta testuale nel suo corrispondente numero usando la mappa creata prima
         label = self.label_map[label_str]
 
-        # 3. Costruisce il percorso completo al file JSON dei landmark per questo video
-        json_path = os.path.join(self.landmarks_dir, f"{video_name}_landmarks.json")
-
-        # 4. Apre e legge il file JSON
-        with open(json_path, "r") as f:
-            data = json.load(f)
-
-        # 5. Estrae e trasforma i dati dei landmark in un formato adatto per il modello
+        # 3. Costruisce il percorso alla cartella dei file JSON OpenPose per questo video
+        video_dir = os.path.join(self.landmarks_dir, video_name)
+        # Lista dei file JSON ordinati per frame
+        json_files = sorted([f for f in os.listdir(video_dir) if f.endswith(".json")])
+        # 4. Estrae e trasforma i keypoints da ogni JSON in un vettore di feature
         sequence = []
-        for frame_data in data:
-            # Per ogni frame, appiattiamo i 468 landmark (ognuno con x, y, z) in un unico grande vettore.
-            # Il risultato sarà un vettore di 468 * 3 = 1404 features per ogni frame.
-            flat_landmarks = [
-                coord
-                for lm in frame_data["landmarks"]
-                for coord in (lm["x"], lm["y"], lm["z"])
-            ]
+        for jf in json_files:
+            frame_path = os.path.join(video_dir, jf)
+            with open(frame_path, "r") as f:
+                frame = json.load(f)
+            people = frame.get("people", [])
+            if not people:
+                continue
+            # Prendiamo solo i pose_keypoints_2d, ignorando la confidenza (ogni terzo valore)
+            keypoints = people[0].get("pose_keypoints_2d", [])
+            flat_landmarks = [coord for i, coord in enumerate(keypoints) if i % 3 != 2]
             sequence.append(flat_landmarks)
 
         # Converte la lista di liste Python in un array NumPy per efficienza
