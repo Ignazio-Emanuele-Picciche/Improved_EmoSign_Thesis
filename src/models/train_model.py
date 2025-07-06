@@ -3,7 +3,7 @@
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score
 import numpy as np
 import os, sys
@@ -31,6 +31,16 @@ PROCESSED_FILE = os.path.join(
 )
 MODEL_SAVE_PATH = os.path.join(BASE_DIR, "models", "emotion_lstm.pth")
 
+# Percorsi specifici per train e validation
+TRAIN_LANDMARKS_DIR = LANDMARKS_DIR
+TRAIN_PROCESSED_FILE = PROCESSED_FILE
+VAL_LANDMARKS_DIR = os.path.join(
+    BASE_DIR, "data", "raw", "val", "openpose_output_val", "json"
+)
+VAL_PROCESSED_FILE = os.path.join(
+    BASE_DIR, "data", "processed", "val", "video_sentiment_data_0.65.csv"
+)
+
 # Iperparametri
 # INPUT_SIZE = 468 * 3  # Calcolato dinamicamente dal dataset, non è più hard-coded
 HIDDEN_SIZE = 256  # Complessità del modello LSTM
@@ -51,18 +61,17 @@ else:
 print(f"Training su dispositivo: {device}")
 
 # --- Sezione 3: Caricamento Dati e Creazione del Modello ---
-# 1. Crea un'istanza del nostro Dataset
+# 1. Crea un'istanza dei nostri Dataset per train e validation
 train_dataset = LandmarkDataset(
-    landmarks_dir=LANDMARKS_DIR, processed_file=PROCESSED_FILE
+    landmarks_dir=TRAIN_LANDMARKS_DIR, processed_file=TRAIN_PROCESSED_FILE
+)
+val_dataset = LandmarkDataset(
+    landmarks_dir=VAL_LANDMARKS_DIR, processed_file=VAL_PROCESSED_FILE
 )
 
-# 2. Split train/validation (80/20) e DataLoader
-num_classes = len(train_dataset.labels)
-val_size = int(0.2 * len(train_dataset))
-train_size = len(train_dataset) - val_size
-train_subset, val_subset = random_split(train_dataset, [train_size, val_size])
-train_loader = DataLoader(train_subset, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(val_subset, batch_size=BATCH_SIZE)
+# Rimuoviamo lo split e usiamo DataLoader separati
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
 
 # Bilanciamento classi: calcoliamo il peso inverso della frequenza di ogni classe
 labels_array = train_dataset.processed["emotion"].map(train_dataset.label_map).values
@@ -76,6 +85,10 @@ class_weights = torch.tensor(class_weights, dtype=torch.float32).to(
 
 # 3. Determino dinamicamente la dimensione dell'input (numero di feature per frame) dal primo sample
 input_size = train_dataset[0][0].shape[1]  # lunghezza del vettore di feature
+
+# Determina numero di classi
+num_classes = len(train_dataset.labels)
+
 model = EmotionLSTM(input_size, HIDDEN_SIZE, NUM_LAYERS, num_classes, dropout=0.5).to(
     device
 )
