@@ -85,10 +85,6 @@ class_weights = torch.tensor(class_weights, dtype=torch.float32).to(
 
 # 3. Determino dinamicamente la dimensione dell'input (numero di feature per frame) dal primo sample
 input_size = train_dataset[0][0].shape[1]  # lunghezza del vettore di feature
-
-# Determina numero di classi
-num_classes = len(train_dataset.labels)
-
 model = EmotionLSTM(input_size, HIDDEN_SIZE, NUM_LAYERS, num_classes, dropout=0.5).to(
     device
 )
