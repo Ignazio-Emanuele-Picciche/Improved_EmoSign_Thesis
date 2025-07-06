@@ -90,8 +90,11 @@ class LandmarkDataset(Dataset):
             sequence = sequence[: self.max_seq_length]
         else:
             # Se la sequenza è più corta, aggiungiamo righe di zeri (padding) fino a raggiungere la lunghezza massima.
-            # `sequence.shape[1]` è il numero di feature (1404), per creare zeri della giusta dimensione.
-            padding = np.zeros((self.max_seq_length - len(sequence), sequence.shape[1]))
+            # Usa dtype float32 per evitare cast a float64 su MPS.
+            padding = np.zeros(
+                (self.max_seq_length - len(sequence), sequence.shape[1]),
+                dtype=np.float32,
+            )
             sequence = np.vstack((sequence, padding))
 
         # 7. Restituisce i dati come tensori PyTorch.

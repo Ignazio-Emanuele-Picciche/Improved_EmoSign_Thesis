@@ -10,10 +10,18 @@
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
+from sklearn.metrics import f1_score
+import numpy as np
 import os, sys
 
 # Aggiunge la cartella src al PYTHONPATH per consentire import data e models
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
+# Definisce la root del progetto per percorsi assoluti
+BASE_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
+)
+
 from data.emosign_landmark_dataset import (
     LandmarkDataset,
 )  # Importa la classe per gestire i dati
@@ -21,14 +29,12 @@ from models.landmark_model import EmotionLSTM  # Importa l'architettura del mode
 
 # --- Sezione 1: Definizione dei Parametri e Iperparametri ---
 # Percorsi dei file e delle cartelle
-LANDMARKS_DIR = "../../data/raw/openpose_output/json/"  # Cartella con sottocartelle per ogni video contenenti i JSON OpenPose
-METADATA_FILE = (
-    "../../data/processed/metadata.csv"  # File CSV con nomi video e etichette
-)
-MODEL_SAVE_PATH = "../../models/emotion_lstm.pth"  # Dove salvare il modello finale
+LANDMARKS_DIR = os.path.join(BASE_DIR, "data", "raw", "openpose_output", "json")
+METADATA_FILE = os.path.join(BASE_DIR, "data", "processed", "metadata.csv")
+MODEL_SAVE_PATH = os.path.join(BASE_DIR, "models", "emotion_lstm.pth")
 
 # Iperparametri
-INPUT_SIZE = 468 * 3  # Dimensione dell'input, deve corrispondere a quella del dataset
+# INPUT_SIZE = 468 * 3  # Calcolato dinamicamente dal dataset, non è più hard-coded
 HIDDEN_SIZE = 256  # Complessità del modello LSTM
 NUM_LAYERS = 2  # Profondità del modello LSTM
 # NUM_CLASSES = 7  # Numero di emozioni da predire (ora calcolato dinamicamente)
@@ -51,6 +57,7 @@ print(f"Training su dispositivo: {device}")
 train_dataset = LandmarkDataset(
     landmarks_dir=LANDMARKS_DIR, metadata_file=METADATA_FILE
 )
+
 # 2. Split train/validation (80/20) e DataLoader
 num_classes = len(train_dataset.labels)
 val_size = int(0.2 * len(train_dataset))
@@ -59,13 +66,18 @@ train_subset, val_subset = random_split(train_dataset, [train_size, val_size])
 train_loader = DataLoader(train_subset, batch_size=BATCH_SIZE, shuffle=True)
 val_loader = DataLoader(val_subset, batch_size=BATCH_SIZE)
 
-# 3. Inizializza il modello e lo sposta sul dispositivo scelto (CPU o GPU)
-model = EmotionLSTM(INPUT_SIZE, HIDDEN_SIZE, NUM_LAYERS, num_classes).to(device)
+# Calcola pesi di classe inversamente proporzionali alla frequenza
+labels_array = train_dataset.metadata['emotion'].map(train_dataset.label_map).values
+class_counts = np.bincount(labels_array)
+class_weights = [len(labels_array)/(len(class_counts)*c) for c in class_counts]
+class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
 
-# 4. Definisce la funzione di perdita (Loss Function) e l'ottimizzatore
-criterion = (
-    nn.CrossEntropyLoss()
-)  # Misura quanto le previsioni del modello sono sbagliate.
+# 3. Calcola input_size e inizializza il modello sul dispositivo scelto (CPU o GPU)
+input_size = train_dataset[0][0].shape[1]  # lunghezza del vettore di feature
+model = EmotionLSTM(input_size, HIDDEN_SIZE, NUM_LAYERS, num_classes).to(device)
+
+# 4. Definisce la funzione di perdita con pesi di classe e l'ottimizzatore
+criterion = nn.CrossEntropyLoss(weight=class_weights)  # Penala di più la classe minoritaria
 optimizer = torch.optim.Adam(
     model.parameters(), lr=LEARNING_RATE
 )  # Algoritmo che aggiorna i pesi del modello per minimizzare la loss.
@@ -79,7 +91,9 @@ for epoch in range(NUM_EPOCHS):
     model.train()
     train_loss = 0.0
     for sequences, labels in train_loader:
-        sequences, labels = sequences.to(device), labels.to(device)
+        # Sposta dati su device e assicura float32 (MPS supporta solo float32)
+        sequences = sequences.to(device).float()
+        labels = labels.to(device)
         outputs = model(sequences)
         loss = criterion(outputs, labels)
         optimizer.zero_grad()
@@ -93,19 +107,25 @@ for epoch in range(NUM_EPOCHS):
     val_loss = 0.0
     correct = 0
     total = 0
+    all_preds = []
+    all_labels = []
     with torch.no_grad():
         for sequences, labels in val_loader:
-            sequences, labels = sequences.to(device), labels.to(device)
+            sequences = sequences.to(device).float()
+            labels_device = labels.to(device)
             outputs = model(sequences)
-            loss = criterion(outputs, labels)
+            loss = criterion(outputs, labels_device)
             val_loss += loss.item() * labels.size(0)
             _, preds = torch.max(outputs, 1)
-            correct += (preds == labels).sum().item()
+            correct += (preds == labels_device).sum().item()
             total += labels.size(0)
+            all_preds.extend(preds.cpu().numpy().tolist())
+            all_labels.extend(labels.cpu().numpy().tolist())
     val_loss /= total
     val_acc = correct / total
+    val_f1 = f1_score(all_labels, all_preds, average="macro")
     print(
-        f"Epoch {epoch+1}/{NUM_EPOCHS}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}"
+        f"Epoch {epoch+1}/{NUM_EPOCHS}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f}"
     )
     # Salvataggio del modello migliore
     if val_loss < best_val_loss:
