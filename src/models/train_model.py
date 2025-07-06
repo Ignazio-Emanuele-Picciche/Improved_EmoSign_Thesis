@@ -20,6 +20,7 @@ from data.emosign_landmark_dataset import (
     LandmarkDataset,
 )  # Importa la classe per gestire i dati
 from models.landmark_model import EmotionLSTM  # Importa l'architettura del modello
+from models.st_gcn import STGCN  # Aggiunto per ST-GCN support
 
 # --- Sezione 1: Definizione dei Parametri e Iperparametri ---
 # Percorsi dei file e delle cartelle
@@ -49,6 +50,10 @@ NUM_LAYERS = 2  # Profondità del modello LSTM
 BATCH_SIZE = 32  # Quanti video processare in parallelo prima di aggiornare il modello
 NUM_EPOCHS = 50  # Quante volte ripetere l'addestramento sull'intero dataset
 LEARNING_RATE = 0.001  # "Velocità" con cui il modello impara e si corregge
+
+# --- Sezione 1.5: Selezione del modello ---
+# Opzioni: 'lstm' (default) o 'stgcn'
+MODEL_TYPE = "stgcn"  # Sostituisci con 'lstm' per LSTM basato su sentimen
 
 # --- Sezione 2: Setup dell'Ambiente ---
 # Seleziona il dispositivo su cui eseguire i calcoli: Apple Silicon (mps) se disponibile, altrimenti GPU (cuda) o CPU.
@@ -83,11 +88,20 @@ class_weights = torch.tensor(class_weights, dtype=torch.float32).to(
     device
 )  # Sposta i pesi sul device
 
-# 3. Determino dinamicamente la dimensione dell'input (numero di feature per frame) dal primo sample
-input_size = train_dataset[0][0].shape[1]  # lunghezza del vettore di feature
-model = EmotionLSTM(input_size, HIDDEN_SIZE, NUM_LAYERS, num_classes, dropout=0.5).to(
-    device
-)
+# 3. Determino dimensione input e creo il modello in base a MODEL_TYPE
+input_size = train_dataset[0][0].shape[1]  # numero di feature per frame
+num_classes = len(train_dataset.labels)
+if MODEL_TYPE == "lstm":
+    model = EmotionLSTM(
+        input_size, HIDDEN_SIZE, NUM_LAYERS, num_classes, dropout=0.5
+    ).to(device)
+elif MODEL_TYPE == "stgcn":
+    # ricava numero di punti e crea ST-GCN
+    coords_per_point = 2  # x,y per landmark
+    num_point = input_size // coords_per_point  # number of landmark nodes
+    model = STGCN(
+        num_classes, num_point, num_person=1, in_channels=coords_per_point
+    ).to(device)
 
 # 4. Definiamo la loss function con pesi di classe per penalizzare le classi minoritarie.
 # NOTE: Significa che gli errori sulle classi minoritarie avranno un peso maggiore nella loss.
@@ -99,7 +113,6 @@ optimizer = torch.optim.Adam(
 )  # Algoritmo che aggiorna i pesi del modello per minimizzare la loss.
 
 # --- Sezione 4: Ciclo di Addestramento (Training Loop) ---
-# --- Sezione 4: Training Loop con Validazione ---
 print("Inizio training con validazione...")
 best_val_loss = float("inf")
 for epoch in range(NUM_EPOCHS):
@@ -107,7 +120,11 @@ for epoch in range(NUM_EPOCHS):
     model.train()
     train_loss = 0.0
     for sequences, labels in train_loader:
-        # Sposta dati su device e assicura float32 (MPS supporta solo float32)
+        # Pre-processing per ST-GCN
+        if MODEL_TYPE == "stgcn":
+            b, t, f = sequences.shape
+            sequences = sequences.view(b, t, num_point, coords_per_point)
+        # Sposta dati su device e assicura float32
         sequences = sequences.to(device).float()
         labels = labels.to(device)
         outputs = model(sequences)
@@ -127,6 +144,10 @@ for epoch in range(NUM_EPOCHS):
     all_labels = []
     with torch.no_grad():
         for sequences, labels in val_loader:
+            # Pre-processing per ST-GCN
+            if MODEL_TYPE == "stgcn":
+                b, t, f = sequences.shape
+                sequences = sequences.view(b, t, num_point, coords_per_point)
             sequences = sequences.to(device).float()
             labels_device = labels.to(device)
             outputs = model(sequences)
