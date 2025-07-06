@@ -22,23 +22,23 @@ import pandas as pd  # Libreria per la manipolazione e l'analisi di dati, qui us
 class LandmarkDataset(Dataset):
     # Il metodo __init__ viene eseguito una sola volta, quando si crea un'istanza della classe.
     # Prepara le strutture dati iniziali.
-    def __init__(self, landmarks_dir, metadata_file, max_seq_length=100):
+    def __init__(self, landmarks_dir, processed_file, max_seq_length=100):
         """
         Args:
             landmarks_dir (string): Directory che contiene tutti i file JSON con i landmark estratti.
-            metadata_file (string): Percorso del file CSV che contiene i metadati (es. nome del video e emozione associata).
+            processed_file (string): Percorso del file CSV che contiene i metadati (es. nome del video e emozione associata).
             max_seq_length (int): Lunghezza massima a cui tutte le sequenze di landmark verranno standardizzate (tramite padding o troncamento).
         """
         # Memorizza i percorsi e i parametri passati
         self.landmarks_dir = landmarks_dir
-        self.metadata = pd.read_csv(
-            metadata_file
+        self.processed = pd.read_csv(
+            processed_file
         )  # Carica il file CSV in un DataFrame di pandas
         self.max_seq_length = max_seq_length
 
         # Crea una mappatura da etichetta testuale (es. "felice") a un indice numerico (es. 0, 1, 2...).
         # I modelli di machine learning lavorano con numeri, non con stringhe.
-        self.labels = self.metadata[
+        self.labels = self.processed[
             "emotion"
         ].unique()  # Trova tutte le emozioni uniche (es. ['felice', 'triste', 'neutro'])
         self.label_map = {
@@ -49,14 +49,14 @@ class LandmarkDataset(Dataset):
     # Viene usato dal DataLoader di PyTorch per sapere quanti campioni ci sono.
     def __len__(self):
         return len(
-            self.metadata
+            self.processed
         )  # La dimensione è semplicemente il numero di righe nel nostro file di metadati.
 
     # Il metodo __getitem__ è il cuore del Dataset.
     # Ha il compito di caricare e restituire un singolo campione di dati dato un indice `idx`.
     def __getitem__(self, idx):
         # 1. Ottiene le informazioni per il campione richiesto (idx) dal DataFrame
-        video_info = self.metadata.iloc[idx]
+        video_info = self.processed.iloc[idx]
         video_name = video_info["video_name"]
         label_str = video_info["emotion"]
         # 2. Converte l'etichetta testuale nel suo corrispondente numero usando la mappa creata prima
