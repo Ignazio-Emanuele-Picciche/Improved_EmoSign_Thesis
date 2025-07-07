@@ -1,7 +1,7 @@
 __pycache__/
 .venv
 raw/
-models/
+models/*
 
 # VS Code
 .vscode/
