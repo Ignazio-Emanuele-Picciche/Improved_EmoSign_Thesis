@@ -2,6 +2,7 @@ __pycache__/
 .venv
 raw/
 models/*
+mlruns/
 
 # VS Code
 .vscode/

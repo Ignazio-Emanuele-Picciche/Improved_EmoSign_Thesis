@@ -1,3 +1,5 @@
+# mlflow server --host 127.0.0.1 --port 8080
+
 # PANORAMICA DEL FLUSSO:
 
 
@@ -11,6 +13,7 @@ import argparse
 import mlflow
 import mlflow.pytorch
 from mlflow.models.signature import infer_signature
+import requests  # for pinging MLflow server
 
 # Aggiunge la cartella src al PYTHONPATH per consentire import data e models
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
@@ -30,8 +33,7 @@ from models.stgcn_model import STGCN  # Aggiunto per ST-GCN support
 mlflow.set_tracking_uri(uri="http://127.0.0.1:8080")
 
 # Create a new MLflow Experiment
-mlflow.set_experiment("MLflow Quickstart")
-
+mlflow.set_experiment("Emotion Recognition Experiment")
 
 # --- Sezione 1: Definizione dei Parametri e Iperparametri ---
 # Percorsi dei file e delle cartelle
@@ -67,7 +69,15 @@ MODEL_TYPE = "stgcn"  # Sostituisci con 'lstm' per LSTM basato su sentimen
 
 MODEL_SAVE_PATH = os.path.join(BASE_DIR, "models", f"emotion_{MODEL_TYPE}.pth")
 
-mlflow.set_experiment("EmoSign_Training")
+# Define hyperparameters dict for MLflow logging
+params = {
+    "model_type": MODEL_TYPE,
+    "hidden_size": HIDDEN_SIZE,
+    "num_layers": NUM_LAYERS,
+    "batch_size": BATCH_SIZE,
+    "num_epochs": NUM_EPOCHS,
+    "learning_rate": LEARNING_RATE,
+}
 
 
 # --- Sezione 2: Setup dell'Ambiente ---
@@ -129,19 +139,11 @@ optimizer = torch.optim.Adam(
 
 # --- Sezione 4: Ciclo di Addestramento (Training Loop) ---
 print("Inizio training con validazione...")
+# Initialize best validation loss
 best_val_loss = float("inf")
-with mlflow.start_run() as run:
+with mlflow.start_run():
     # Log hyperparameters
-    mlflow.log_params(
-        {
-            "model_type": MODEL_TYPE,
-            "hidden_size": HIDDEN_SIZE,
-            "num_layers": NUM_LAYERS,
-            "batch_size": BATCH_SIZE,
-            "num_epochs": NUM_EPOCHS,
-            "learning_rate": LEARNING_RATE,
-        }
-    )
+    mlflow.log_params(params)
 
     for epoch in range(NUM_EPOCHS):
         # Training phase
@@ -198,9 +200,14 @@ with mlflow.start_run() as run:
             best_val_loss = val_loss
             torch.save(model.state_dict(), MODEL_SAVE_PATH)
             print(f"Salvato modello migliorato (Val Loss: {best_val_loss:.4f})")
+        # Log metrics for this epoch
+        mlflow.log_metric("train_loss", train_loss, step=epoch)
+        mlflow.log_metric("val_loss", val_loss, step=epoch)
+        mlflow.log_metric("val_f1", val_f1, step=epoch)
+        mlflow.log_metric("val_acc", val_acc, step=epoch)
     print(f"Training completato. Miglior modello salvato in {MODEL_SAVE_PATH}")
 
-    # After training: log final metrics
+    # After training: log final metrics (best)
     mlflow.log_metric("best_val_loss", best_val_loss)
     mlflow.log_metric("best_val_f1", val_f1)
 
@@ -212,12 +219,16 @@ with mlflow.start_run() as run:
         .detach()
         .numpy(),
     )
-    mlflow.pytorch.log_model(
+    model_info = mlflow.pytorch.log_model(
         pytorch_model=model,
         artifact_path="model",
         signature=signature,
         registered_model_name="EmoSign_pytorch",
     )
+
+    # Tag the run for reference
+    mlflow.set_tag("experiment_purpose", "PyTorch emotion recognition")
+    mlflow.set_tag("run_id", run.info.run_id)
 
 # parsing iperparametri da linea di comando
 parser = argparse.ArgumentParser(description="Train EmotionLSTM with hyperparameters")
