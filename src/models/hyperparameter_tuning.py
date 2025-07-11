@@ -1,4 +1,6 @@
-# python src/models/hyperparameter_tuning.py --model_type lstm --n_trials 30 --num_epochs 10
+# python src/models/hyperparameter_tuning.py --model_type lstm --n_trials 15 --num_epochs 20
+# python src/models/hyperparameter_tuning.py --model_type lstm --n_trials 40 --num_epochs 40
+# mlflow server --host 127.0.0.1 --port 8080
 
 import os
 import sys
@@ -12,6 +14,7 @@ import numpy as np
 import mlflow
 import mlflow.pytorch
 from mlflow.models.signature import infer_signature
+from optuna.pruners import MedianPruner
 
 # Add project src to PATH
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
@@ -22,6 +25,7 @@ BASE_DIR = os.path.abspath(
 from data_pipeline.landmark_dataset import LandmarkDataset
 from models.lstm_model import EmotionLSTM
 from models.stgcn_model import STGCN
+from optuna.exceptions import TrialPruned
 
 # MLflow tracking setup
 mlflow.set_tracking_uri("http://127.0.0.1:8080")
@@ -48,15 +52,16 @@ VAL_PROCESSED_FILE = os.path.join(
 # Globals for closure
 NUM_EPOCHS = 5
 MODEL_TYPE = "lstm"
+PATIENCE = 5  # early stopping patience
 
 
 def objective(trial):
-    # Suggest hyperparameters
-    hidden_size = trial.suggest_int("hidden_size", 64, 512, step=64)
-    num_layers = trial.suggest_int("num_layers", 1, 4)
-    dropout = trial.suggest_float("dropout", 0.0, 0.5)
-    learning_rate = trial.suggest_loguniform("learning_rate", 1e-4, 1e-2)
-    batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+    # Suggest hyperparameters (range affinati in base ai risultati precedenti)
+    hidden_size = trial.suggest_int("hidden_size", 256, 1024, step=128)
+    num_layers = trial.suggest_int("num_layers", 1, 6)
+    dropout = trial.suggest_float("dropout", 0.0, 0.2)
+    learning_rate = trial.suggest_loguniform("learning_rate", 5e-4, 5e-3)
+    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128])
 
     # Load data
     train_dataset = LandmarkDataset(
@@ -111,7 +116,12 @@ def objective(trial):
         }
         mlflow.log_params(params)
         best_val_loss = float("inf")
+        best_val_f1 = 0.0
+        early_stopper = EarlyStopping(
+            patience=PATIENCE, verbose=False, path=f"trial_{trial.number}_best.pth"
+        )
         final_val_loss = 0.0  # inizializza variabile di fallback
+        final_val_f1 = 0.0
         for epoch in range(NUM_EPOCHS):
             # Training
             model.train()
@@ -163,6 +173,14 @@ def objective(trial):
                 val_f1 = f1_score(all_labels, all_preds, average="macro")
             # memorizza valore di validazione per fallback
             final_val_loss = val_loss
+            final_val_f1 = val_f1
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                epochs_no_improve = 0  # resetta il contatore se migliora
+            else:
+                epochs_no_improve += 1
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
             # Log metrics per epoch
             mlflow.log_metrics(
                 {
@@ -173,12 +191,19 @@ def objective(trial):
                 },
                 step=epoch,
             )
+            # Early stopping check
+            early_stopper(val_loss, model)
+            if early_stopper.early_stop:
+                print(f"Trial {trial.number} early stopping at epoch {epoch+1}")
+                break
         # Log delle metriche finali di fine trial
-        # Assicuriamoci che best_val_loss non sia inf
+        # fallback se non abbiamo trovato miglioramento
         if not np.isfinite(best_val_loss):
             best_val_loss = final_val_loss
+        if best_val_f1 == 0.0:
+            best_val_f1 = final_val_f1
         # Log delle metriche finali di fine trial
-        mlflow.log_metrics({"best_val_loss": best_val_loss})
+        mlflow.log_metrics({"best_val_loss": best_val_loss, "best_val_f1": best_val_f1})
         return best_val_loss
 
 
@@ -201,7 +226,10 @@ def main():
     # Parent MLflow run per studio di ottimizzazione
     run_name = f"Optuna_{MODEL_TYPE}_tuning"
     with mlflow.start_run(run_name=run_name):
-        study = optuna.create_study(direction="minimize")
+        study = optuna.create_study(
+            direction="minimize",
+            pruner=MedianPruner(n_startup_trials=PATIENCE, n_warmup_steps=1),
+        )
         study.optimize(objective, n_trials=args.n_trials)
         # Log global tuning info
         mlflow.log_param("n_trials", args.n_trials)

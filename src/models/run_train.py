@@ -2,6 +2,14 @@
 
 # PANORAMICA DEL FLUSSO:
 
+# python src/models/run_train.py \
+#   --model_type lstm \
+#   --batch_size 64 \
+#   --hidden_size 512 \
+#   --num_layers 2 \
+#   --learning_rate 0.0012830838516502473 \
+#   --dropout 0.0005204106154637622 \
+#   --num_epochs 50
 
 import torch
 import torch.nn as nn
@@ -28,6 +36,12 @@ from data_pipeline.landmark_dataset import (
 from models.lstm_model import EmotionLSTM  # Importa l'architettura del modello LSTM
 from models.stgcn_model import STGCN  # Aggiunto per ST-GCN support
 
+# Removed custom EarlyStopping; using Ignite handlers instead
+
+## Ignite imports for callback-based training
+from ignite.engine import Events, create_supervised_trainer, create_supervised_evaluator
+from ignite.metrics import Loss, Accuracy, F1
+from ignite.handlers import EarlyStopping as IgniteEarlyStopping, ModelCheckpoint
 
 # Set our tracking server uri for logging
 mlflow.set_tracking_uri(uri="http://127.0.0.1:8080")
@@ -61,11 +75,12 @@ NUM_LAYERS = 2  # Profondità del modello LSTM
 # NUM_CLASSES = 7  # Numero di emozioni da predire (ora calcolato dinamicamente)
 BATCH_SIZE = 32  # Quanti video processare in parallelo prima di aggiornare il modello
 NUM_EPOCHS = 50  # Quante volte ripetere l'addestramento sull'intero dataset
+PATIENCE = 10  # Early stopping patience
 LEARNING_RATE = 0.001  # "Velocità" con cui il modello impara e si corregge
 
 # --- Sezione 1.5: Selezione del modello ---
 # Opzioni: 'lstm' (default) o 'stgcn'
-MODEL_TYPE = "stgcn"  # Sostituisci con 'lstm' per LSTM basato su sentimen
+MODEL_TYPE = "lstm"  # Sostituisci con 'lstm' per LSTM basato su sentimen
 
 MODEL_SAVE_PATH = os.path.join(BASE_DIR, "models", f"emotion_{MODEL_TYPE}.pth")
 
@@ -136,76 +151,68 @@ criterion = nn.CrossEntropyLoss(
 optimizer = torch.optim.Adam(
     model.parameters(), lr=LEARNING_RATE
 )  # Algoritmo che aggiorna i pesi del modello per minimizzare la loss.
+# Setup Ignite trainer and evaluator
+trainer = create_supervised_trainer(model, optimizer, criterion, device=device)
+evaluator = create_supervised_evaluator(
+    model,
+    metrics={
+        "val_loss": Loss(criterion),
+        "val_acc": Accuracy(),
+        "val_f1": F1(average=True),
+    },
+    device=device,
+)
+# Checkpoint handler: save best model by val_loss
+checkpoint_handler = ModelCheckpoint(
+    dirname=os.path.join(BASE_DIR, "models"),
+    filename_prefix=f"emotion_{MODEL_TYPE}",
+    n_saved=1,
+    create_dir=True,
+    score_function=lambda eng: -eng.state.metrics["val_loss"],
+    score_name="val_loss",
+)
+evaluator.add_event_handler(Events.COMPLETED, checkpoint_handler, {"model": model})
+# EarlyStopping handler
+earlystop_handler = IgniteEarlyStopping(
+    patience=PATIENCE,
+    score_function=lambda eng: -eng.state.metrics["val_loss"],
+    trainer=trainer,
+)
+evaluator.add_event_handler(Events.COMPLETED, earlystop_handler)
 
 # --- Sezione 4: Ciclo di Addestramento (Training Loop) ---
-print("Inizio training con validazione...")
-# Initialize best validation loss
-best_val_loss = float("inf")
-with mlflow.start_run():
+print("Inizio training con validazione (Ignite)...")
+
+run_name = f"EmotionRecognition_{MODEL_TYPE}_train"
+
+with mlflow.start_run(run_name=run_name) as run:
     # Log hyperparameters
     mlflow.log_params(params)
 
-    for epoch in range(NUM_EPOCHS):
-        # Training phase
-        model.train()
-        train_loss = 0.0
-        for sequences, labels in train_loader:
-            # Pre-processing per ST-GCN
-            if MODEL_TYPE == "stgcn":
-                b, t, f = sequences.shape
-                sequences = sequences.view(b, t, num_point, coords_per_point)
-            # Sposta dati su device e assicura float32
-            sequences = sequences.to(device).float()
-            labels = labels.to(device)
-            outputs = model(sequences)
-            loss = criterion(outputs, labels)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item() * labels.size(0)
-        train_loss /= len(train_loader.dataset)
+    # On each epoch end: run evaluation and log metrics
+    @trainer.on(Events.EPOCH_COMPLETED)
+    def validate_and_log(engine):
+        evaluator.run(val_loader)
+        metrics = evaluator.state.metrics
+        mlflow.log_metrics(
+            {
+                "val_loss": metrics["val_loss"],
+                "val_acc": metrics["val_acc"],
+                "val_f1": metrics["val_f1"],
+            },
+            step=engine.state.epoch,
+        )
+        print(
+            f"Epoch {engine.state.epoch}/{NUM_EPOCHS}, "
+            f"Val Loss: {metrics['val_loss']:.4f}, "
+            f"Val Acc: {metrics['val_acc']:.4f}, "
+            f"Val F1: {metrics['val_f1']:.4f}"
+        )
 
-        # Validation phase
-        model.eval()
-        val_loss = 0.0
-        correct = 0
-        total = 0
-        all_preds = []
-        all_labels = []
-        with torch.no_grad():
-            for sequences, labels in val_loader:
-                # Pre-processing per ST-GCN
-                if MODEL_TYPE == "stgcn":
-                    b, t, f = sequences.shape
-                    sequences = sequences.view(b, t, num_point, coords_per_point)
-                sequences = sequences.to(device).float()
-                labels_device = labels.to(device)
-                outputs = model(sequences)
-                loss = criterion(outputs, labels_device)
-                val_loss += loss.item() * labels.size(0)
-                _, preds = torch.max(outputs, 1)
-                correct += (preds == labels_device).sum().item()
-                total += labels.size(0)
-                all_preds.extend(preds.cpu().numpy().tolist())
-                all_labels.extend(labels.cpu().numpy().tolist())
-            val_loss /= total
-            val_acc = correct / total
-            # Calcolo F1 macro per valutare performance di classificazione bilanciata
-            val_f1 = f1_score(all_labels, all_preds, average="macro")
-            print(
-                f"Epoch {epoch+1}/{NUM_EPOCHS}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f}"
-            )
-        # Salvataggio del modello migliore
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), MODEL_SAVE_PATH)
-            print(f"Salvato modello migliorato (Val Loss: {best_val_loss:.4f})")
-        # Log metrics for this epoch
-        mlflow.log_metric("train_loss", train_loss, step=epoch)
-        mlflow.log_metric("val_loss", val_loss, step=epoch)
-        mlflow.log_metric("val_f1", val_f1, step=epoch)
-        mlflow.log_metric("val_acc", val_acc, step=epoch)
-    print(f"Training completato. Miglior modello salvato in {MODEL_SAVE_PATH}")
+    # Run training with Ignite
+    trainer.run(train_loader, max_epochs=NUM_EPOCHS)
+
+    print(f"Training completato. Best model saved in {checkpoint_handler._saved[-1]}")
 
     # After training: log final metrics (best)
     mlflow.log_metric("best_val_loss", best_val_loss)
