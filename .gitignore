@@ -3,6 +3,7 @@ __pycache__/
 raw/
 models/*
 mlruns/
+mlartifacts/
 
 # VS Code
 .vscode/

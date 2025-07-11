@@ -40,7 +40,7 @@ from models.stgcn_model import STGCN  # Aggiunto per ST-GCN support
 
 ## Ignite imports for callback-based training
 from ignite.engine import Events, create_supervised_trainer, create_supervised_evaluator
-from ignite.metrics import Loss, Accuracy, F1
+from ignite.metrics import Loss, Accuracy
 from ignite.handlers import EarlyStopping as IgniteEarlyStopping, ModelCheckpoint
 
 # Set our tracking server uri for logging
@@ -75,7 +75,7 @@ NUM_LAYERS = 2  # Profondità del modello LSTM
 # NUM_CLASSES = 7  # Numero di emozioni da predire (ora calcolato dinamicamente)
 BATCH_SIZE = 32  # Quanti video processare in parallelo prima di aggiornare il modello
 NUM_EPOCHS = 50  # Quante volte ripetere l'addestramento sull'intero dataset
-PATIENCE = 10  # Early stopping patience
+PATIENCE = 20  # Early stopping patience
 LEARNING_RATE = 0.001  # "Velocità" con cui il modello impara e si corregge
 
 # --- Sezione 1.5: Selezione del modello ---
@@ -151,23 +151,23 @@ criterion = nn.CrossEntropyLoss(
 optimizer = torch.optim.Adam(
     model.parameters(), lr=LEARNING_RATE
 )  # Algoritmo che aggiorna i pesi del modello per minimizzare la loss.
-# Setup Ignite trainer and evaluator
+# Setup Ignite trainer and evaluator on the same device; accumulate metrics on CPU to avoid float64 MPS errors
 trainer = create_supervised_trainer(model, optimizer, criterion, device=device)
 evaluator = create_supervised_evaluator(
     model,
     metrics={
-        "val_loss": Loss(criterion),
-        "val_acc": Accuracy(),
-        "val_f1": F1(average=True),
+        "val_loss": Loss(criterion, device="cpu"),
+        "val_acc": Accuracy(device="cpu"),
     },
     device=device,
 )
-# Checkpoint handler: save best model by val_loss
+# Checkpoint handler: save best model by val_loss (allow non-empty directory)
 checkpoint_handler = ModelCheckpoint(
     dirname=os.path.join(BASE_DIR, "models"),
     filename_prefix=f"emotion_{MODEL_TYPE}",
     n_saved=1,
     create_dir=True,
+    require_empty=False,
     score_function=lambda eng: -eng.state.metrics["val_loss"],
     score_name="val_loss",
 )
@@ -188,25 +188,61 @@ run_name = f"EmotionRecognition_{MODEL_TYPE}_train"
 with mlflow.start_run(run_name=run_name) as run:
     # Log hyperparameters
     mlflow.log_params(params)
+    # Initialize best metrics for logging after training
+    best_metrics = {"val_loss": float("inf"), "val_f1": 0.0}
 
     # On each epoch end: run evaluation and log metrics
     @trainer.on(Events.EPOCH_COMPLETED)
     def validate_and_log(engine):
+        # Compute average training loss on train_loader
+        model.eval()
+        train_loss_sum = 0.0
+        with torch.no_grad():
+            for xb, yb in train_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                outputs = model(xb.float())
+                loss = criterion(outputs, yb)
+                train_loss_sum += loss.item() * xb.size(0)
+        train_loss = train_loss_sum / len(train_loader.dataset)
+
         evaluator.run(val_loader)
         metrics = evaluator.state.metrics
+        val_loss = metrics["val_loss"]
+        val_acc = metrics["val_acc"]
+        # Compute F1 manually on CPU to avoid MPS float64 errors
+        y_true, y_pred = [], []
+        model.eval()
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+                outputs = model(xb.float())
+                preds = torch.argmax(outputs, dim=1)
+                y_true.extend(yb.cpu().numpy())
+                y_pred.extend(preds.cpu().numpy())
+        val_f1 = f1_score(y_true, y_pred, average="weighted")
+
+        # Update best metrics
+        if val_loss < best_metrics["val_loss"]:
+            best_metrics["val_loss"] = val_loss
+        if val_f1 > best_metrics["val_f1"]:
+            best_metrics["val_f1"] = val_f1
+
         mlflow.log_metrics(
             {
-                "val_loss": metrics["val_loss"],
-                "val_acc": metrics["val_acc"],
-                "val_f1": metrics["val_f1"],
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "val_f1": val_f1,
             },
             step=engine.state.epoch,
         )
         print(
             f"Epoch {engine.state.epoch}/{NUM_EPOCHS}, "
-            f"Val Loss: {metrics['val_loss']:.4f}, "
-            f"Val Acc: {metrics['val_acc']:.4f}, "
-            f"Val F1: {metrics['val_f1']:.4f}"
+            f"Train Loss: {train_loss:.4f}, "
+            f"Val Loss: {val_loss:.4f}, "
+            f"Val Acc: {val_acc:.4f}, "
+            f"Val F1: {val_f1:.4f}"
         )
 
     # Run training with Ignite
@@ -215,8 +251,8 @@ with mlflow.start_run(run_name=run_name) as run:
     print(f"Training completato. Best model saved in {checkpoint_handler._saved[-1]}")
 
     # After training: log final metrics (best)
-    mlflow.log_metric("best_val_loss", best_val_loss)
-    mlflow.log_metric("best_val_f1", val_f1)
+    mlflow.log_metric("best_val_loss", best_metrics["val_loss"])
+    mlflow.log_metric("best_val_f1", best_metrics["val_f1"])
 
     # Infer model signature and log the model
     signature = infer_signature(
