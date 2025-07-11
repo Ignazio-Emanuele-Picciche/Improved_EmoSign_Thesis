@@ -75,8 +75,9 @@ NUM_LAYERS = 2  # Profondità del modello LSTM
 # NUM_CLASSES = 7  # Numero di emozioni da predire (ora calcolato dinamicamente)
 BATCH_SIZE = 32  # Quanti video processare in parallelo prima di aggiornare il modello
 NUM_EPOCHS = 50  # Quante volte ripetere l'addestramento sull'intero dataset
-PATIENCE = 20  # Early stopping patience
+PATIENCE = 8  # Early stopping patience
 LEARNING_RATE = 0.001  # "Velocità" con cui il modello impara e si corregge
+DROP_OUT = 0.2  # Dropout rate to regularize
 
 # --- Sezione 1.5: Selezione del modello ---
 # Opzioni: 'lstm' (default) o 'stgcn'
@@ -92,6 +93,8 @@ params = {
     "batch_size": BATCH_SIZE,
     "num_epochs": NUM_EPOCHS,
     "learning_rate": LEARNING_RATE,
+    "patience": PATIENCE,
+    "dropout": DROP_OUT,
 }
 
 
@@ -116,7 +119,8 @@ val_dataset = LandmarkDataset(
 
 # Rimuoviamo lo split e usiamo DataLoader separati
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+# Validation loader: no shuffle for reproducibility
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 # Bilanciamento classi: calcoliamo il peso inverso della frequenza di ogni classe
 labels_array = train_dataset.processed["emotion"].map(train_dataset.label_map).values
@@ -133,7 +137,7 @@ input_size = train_dataset[0][0].shape[1]  # numero di feature per frame
 num_classes = len(train_dataset.labels)
 if MODEL_TYPE == "lstm":
     model = EmotionLSTM(
-        input_size, HIDDEN_SIZE, NUM_LAYERS, num_classes, dropout=0.5
+        input_size, HIDDEN_SIZE, NUM_LAYERS, num_classes, dropout=DROP_OUT
     ).to(device)
 elif MODEL_TYPE == "stgcn":
     # ricava numero di punti e crea ST-GCN
@@ -151,8 +155,19 @@ criterion = nn.CrossEntropyLoss(
 optimizer = torch.optim.Adam(
     model.parameters(), lr=LEARNING_RATE
 )  # Algoritmo che aggiorna i pesi del modello per minimizzare la loss.
+# Scheduler: reduce LR on plateau of val_f1
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=3)
+
 # Setup Ignite trainer and evaluator on the same device; accumulate metrics on CPU to avoid float64 MPS errors
 trainer = create_supervised_trainer(model, optimizer, criterion, device=device)
+# Gradient clipping
+trainer.add_event_handler(
+    Events.ITERATION_STARTED,
+    lambda engine: torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0),
+)
+
 evaluator = create_supervised_evaluator(
     model,
     metrics={
@@ -244,6 +259,8 @@ with mlflow.start_run(run_name=run_name) as run:
             f"Val Acc: {val_acc:.4f}, "
             f"Val F1: {val_f1:.4f}"
         )
+        # Step scheduler on validation loss
+        scheduler.step(val_loss)
 
     # Run training with Ignite
     trainer.run(train_loader, max_epochs=NUM_EPOCHS)
@@ -275,26 +292,24 @@ with mlflow.start_run(run_name=run_name) as run:
 
 # parsing iperparametri da linea di comando
 parser = argparse.ArgumentParser(description="Train EmotionLSTM with hyperparameters")
-parser.add_argument("--batch_size", type=int, default=BATCH_SIZE, help="Batch size")
-parser.add_argument("--hidden_size", type=int, default=HIDDEN_SIZE, help="Hidden size")
-parser.add_argument(
-    "--num_layers", type=int, default=NUM_LAYERS, help="Number of LSTM layers"
-)
-parser.add_argument(
-    "--learning_rate", type=float, default=LEARNING_RATE, help="Learning rate"
-)
-parser.add_argument(
-    "--num_epochs", type=int, default=NUM_EPOCHS, help="Number of epochs"
-)
-parser.add_argument("--dropout", type=float, default=0.5, help="Dropout rate")
+parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
+parser.add_argument("--hidden_size", type=int, default=HIDDEN_SIZE)
+parser.add_argument("--num_layers", type=int, default=NUM_LAYERS)
+parser.add_argument("--learning_rate", type=float, default=LEARNING_RATE)
+parser.add_argument("--num_epochs", type=int, default=NUM_EPOCHS)
+parser.add_argument("--dropout", type=float, default=0.5)
+parser.add_argument("--patience", type=int, default=PATIENCE)
 args = parser.parse_args()
 
-# override default iperparametri con valori da linea di comando
+# Override hyperparameters from CLI
 BATCH_SIZE = args.batch_size
 HIDDEN_SIZE = args.hidden_size
 NUM_LAYERS = args.num_layers
 LEARNING_RATE = args.learning_rate
 NUM_EPOCHS = args.num_epochs
+PATIENCE = args.patience
+DROPOUT = args.dropout
+params.update({"dropout": DROPOUT, "patience": PATIENCE})
 
 
 # python train_model.py --batch_size 64 --hidden_size 512 --num_layers 3 --learning_rate 0.0005 --dropout 0.3

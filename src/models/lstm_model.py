@@ -7,6 +7,14 @@
 # Il suo compito è ricevere una sequenza di landmark e produrre in output le probabilità
 # per ciascuna classe di emozione.
 
+# ARCHITETTURA DEL MODELLO:
+# La rete è composta da un layer LSTM che elabora la sequenza temporale e
+# un layer fully connected (lineare) che mappa l'output dell'LSTM sul numero di classi di emozioni.
+# Il layer LSTM è configurato con un certo numero di neuroni (hidden_size) e
+# può essere composto da più strati (num_layers).
+# Il dropout è applicato tra i layer per prevenire l'overfitting, "spegnendo" casualmente
+# alcuni neuroni durante l'addestramento.
+
 import torch
 import torch.nn as nn
 
