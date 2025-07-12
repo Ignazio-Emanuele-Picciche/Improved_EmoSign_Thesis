@@ -16,6 +16,15 @@ import mlflow.pytorch
 from mlflow.models.signature import infer_signature
 from optuna.pruners import MedianPruner
 
+# Ignite imports
+from ignite.engine import Events, create_supervised_trainer, create_supervised_evaluator
+from ignite.metrics import Loss, Accuracy
+from ignite.handlers import EarlyStopping as IgniteEarlyStopping, ModelCheckpoint
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from optuna.integration import PyTorchIgnitePruningHandler
+from optuna.exceptions import TrialPruned
+
+
 # Add project src to PATH
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
 BASE_DIR = os.path.abspath(
@@ -25,7 +34,6 @@ BASE_DIR = os.path.abspath(
 from data_pipeline.landmark_dataset import LandmarkDataset
 from models.lstm_model import EmotionLSTM
 from models.stgcn_model import STGCN
-from optuna.exceptions import TrialPruned
 
 # MLflow tracking setup
 mlflow.set_tracking_uri("http://127.0.0.1:8080")
@@ -86,6 +94,7 @@ def objective(trial):
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
+    class_weights = class_weights.to(device)
 
     # Model instantiation
     input_size = train_dataset[0][0].shape[1]
@@ -103,6 +112,14 @@ def objective(trial):
 
     criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=3)
+
+    trainer = create_supervised_trainer(model, optimizer, criterion, device=device)
+    evaluator = create_supervised_evaluator(
+        model,
+        metrics={"val_loss": Loss(criterion), "val_acc": Accuracy()},
+        device=device,
+    )
 
     # nested MLflow run per trial
     with mlflow.start_run(nested=True):
@@ -115,96 +132,101 @@ def objective(trial):
             "model_type": MODEL_TYPE,
         }
         mlflow.log_params(params)
-        best_val_loss = float("inf")
-        best_val_f1 = 0.0
-        early_stopper = EarlyStopping(
-            patience=PATIENCE, verbose=False, path=f"trial_{trial.number}_best.pth"
-        )
-        final_val_loss = 0.0  # inizializza variabile di fallback
-        final_val_f1 = 0.0
-        for epoch in range(NUM_EPOCHS):
-            # Training
-            model.train()
-            train_loss = 0.0
-            for seq, lbl in train_loader:
-                if MODEL_TYPE == "stgcn":
-                    b, t, f = seq.shape
-                    seq = seq.view(b, t, -1, 2)
-                seq = seq.to(device).float()
-                lbl = lbl.to(device)
-                out = model(seq)
-                loss = criterion(out, lbl)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                train_loss += loss.item() * lbl.size(0)
-            # Validation
+        # Log mapping from class indices to emotion labels
+        class_map = {i: label for i, label in enumerate(train_dataset.labels)}
+        mlflow.log_params({f"class_{i}": label for i, label in class_map.items()})
+
+        best_metrics = {"val_loss": float("inf"), "val_f1": 0.0, "val_f1_macro": 0.0}
+
+        @trainer.on(Events.EPOCH_COMPLETED)
+        def log_validation_results(engine):
+            # Compute average training loss for this epoch
             model.eval()
-            val_loss = 0.0
+            train_loss_sum = 0.0
             with torch.no_grad():
-                for seq, lbl in val_loader:
+                for xb, yb in train_loader:
+                    xb, yb = xb.to(device), yb.to(device)
+                    outputs = model(xb.float())
+                    loss = criterion(outputs, yb)
+                    train_loss_sum += loss.item() * xb.size(0)
+            train_loss = train_loss_sum / len(train_loader.dataset)
+            evaluator.run(val_loader)
+            metrics = evaluator.state.metrics
+            val_loss = metrics["val_loss"]
+            val_acc = metrics["val_acc"]
+
+            y_true, y_pred = [], []
+            model.eval()
+            with torch.no_grad():
+                for xb, yb in val_loader:
                     if MODEL_TYPE == "stgcn":
-                        b, t, f = seq.shape
-                        seq = seq.view(b, t, -1, 2)
-                    seq = seq.to(device).float()
-                    lbl = lbl.to(device)
-                    out = model(seq)
-                    loss = criterion(out, lbl)
-                    val_loss += loss.item() * lbl.size(0)
-                val_loss /= len(val_loader.dataset)
-                # calcolo accuracy e F1-score per monitoraggio
-                correct = 0
-                total = 0
-                all_preds = []
-                all_labels = []
-                for seq, lbl in val_loader:
-                    if MODEL_TYPE == "stgcn":
-                        b, t, f = seq.shape
-                        seq = seq.view(b, t, -1, 2)
-                    seq = seq.to(device).float()
-                    lbl = lbl.to(device)
-                    out = model(seq)
-                    _, preds = torch.max(out, 1)
-                    correct += (preds == lbl).sum().item()
-                    total += lbl.size(0)
-                    all_preds.extend(preds.cpu().numpy().tolist())
-                    all_labels.extend(lbl.cpu().numpy().tolist())
-                val_acc = correct / total if total else 0.0
-                val_f1 = f1_score(all_labels, all_preds, average="macro")
-            # memorizza valore di validazione per fallback
-            final_val_loss = val_loss
-            final_val_f1 = val_f1
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                epochs_no_improve = 0  # resetta il contatore se migliora
-            else:
-                epochs_no_improve += 1
-            if val_f1 > best_val_f1:
-                best_val_f1 = val_f1
-            # Log metrics per epoch
+                        b, t, f = xb.shape
+                        xb = xb.view(b, t, -1, 2)
+                    xb = xb.to(device)
+                    outputs = model(xb.float())
+                    preds = torch.argmax(outputs, dim=1)
+                    y_true.extend(yb.cpu().numpy())
+                    y_pred.extend(preds.cpu().numpy())
+            val_f1 = f1_score(y_true, y_pred, average="weighted")
+            # Compute macro F1 and per-class F1
+            val_f1_macro = f1_score(y_true, y_pred, average="macro")
+            f1_per_class = f1_score(y_true, y_pred, average=None)
+            # Update best macro F1
+            if val_f1_macro > best_metrics["val_f1_macro"]:
+                best_metrics["val_f1_macro"] = val_f1_macro
+
+            if val_loss < best_metrics["val_loss"]:
+                best_metrics["val_loss"] = val_loss
+            if val_f1 > best_metrics["val_f1"]:
+                best_metrics["val_f1"] = val_f1
+
             mlflow.log_metrics(
                 {
-                    "train_loss": train_loss / len(train_loader.dataset),
+                    "train_loss": train_loss,
                     "val_loss": val_loss,
                     "val_acc": val_acc,
                     "val_f1": val_f1,
+                    "val_f1_macro": val_f1_macro,
+                    "val_f1_class_0": float(f1_per_class[0]),
+                    "val_f1_class_1": (
+                        float(f1_per_class[1]) if len(f1_per_class) > 1 else None
+                    ),
                 },
-                step=epoch,
+                step=engine.state.epoch,
             )
-            # Early stopping check
-            early_stopper(val_loss, model)
-            if early_stopper.early_stop:
-                print(f"Trial {trial.number} early stopping at epoch {epoch+1}")
-                break
+            scheduler.step(val_loss)
+
+        # Optuna pruner
+        pruning_handler = PyTorchIgnitePruningHandler(trial, "val_loss", trainer)
+        evaluator.add_event_handler(Events.COMPLETED, pruning_handler)
+
+        # Early stopping
+        early_stopper = IgniteEarlyStopping(
+            patience=PATIENCE,
+            score_function=lambda eng: -eng.state.metrics["val_loss"],
+            trainer=trainer,
+        )
+        evaluator.add_event_handler(Events.COMPLETED, early_stopper)
+
+        try:
+            trainer.run(train_loader, max_epochs=NUM_EPOCHS)
+        except TrialPruned:
+            mlflow.set_tag("status", "pruned")
+            raise
+
         # Log delle metriche finali di fine trial
-        # fallback se non abbiamo trovato miglioramento
-        if not np.isfinite(best_val_loss):
-            best_val_loss = final_val_loss
-        if best_val_f1 == 0.0:
-            best_val_f1 = final_val_f1
-        # Log delle metriche finali di fine trial
-        mlflow.log_metrics({"best_val_loss": best_val_loss, "best_val_f1": best_val_f1})
-        return best_val_loss
+        mlflow.log_metrics(
+            {
+                "best_val_loss": best_metrics["val_loss"],
+                "best_val_f1": best_metrics["val_f1"],
+                "best_val_f1_macro": best_metrics["val_f1_macro"],
+                # "best_val_f1_class_0": float(f1_per_class[0]),
+                # "best_val_f1_class_1": (
+                #     float(f1_per_class[1]) if len(f1_per_class) > 1 else None
+                # ),
+            }
+        )
+        return best_metrics["val_loss"]
 
 
 def main():

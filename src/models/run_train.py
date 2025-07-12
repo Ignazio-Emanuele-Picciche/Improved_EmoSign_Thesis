@@ -204,7 +204,7 @@ with mlflow.start_run(run_name=run_name) as run:
     # Log hyperparameters
     mlflow.log_params(params)
     # Initialize best metrics for logging after training
-    best_metrics = {"val_loss": float("inf"), "val_f1": 0.0}
+    best_metrics = {"val_loss": float("inf"), "val_f1": 0.0, "val_f1_macro": 0.0}
 
     # On each epoch end: run evaluation and log metrics
     @trainer.on(Events.EPOCH_COMPLETED)
@@ -236,12 +236,16 @@ with mlflow.start_run(run_name=run_name) as run:
                 y_true.extend(yb.cpu().numpy())
                 y_pred.extend(preds.cpu().numpy())
         val_f1 = f1_score(y_true, y_pred, average="weighted")
+        # Compute macro F1
+        val_f1_macro = f1_score(y_true, y_pred, average="macro")
 
         # Update best metrics
         if val_loss < best_metrics["val_loss"]:
             best_metrics["val_loss"] = val_loss
         if val_f1 > best_metrics["val_f1"]:
             best_metrics["val_f1"] = val_f1
+        if val_f1_macro > best_metrics["val_f1_macro"]:
+            best_metrics["val_f1_macro"] = val_f1_macro
 
         mlflow.log_metrics(
             {
@@ -249,6 +253,7 @@ with mlflow.start_run(run_name=run_name) as run:
                 "val_loss": val_loss,
                 "val_acc": val_acc,
                 "val_f1": val_f1,
+                "val_f1_macro": val_f1_macro,
             },
             step=engine.state.epoch,
         )
@@ -270,6 +275,7 @@ with mlflow.start_run(run_name=run_name) as run:
     # After training: log final metrics (best)
     mlflow.log_metric("best_val_loss", best_metrics["val_loss"])
     mlflow.log_metric("best_val_f1", best_metrics["val_f1"])
+    mlflow.log_metric("best_val_f1_macro", best_metrics["val_f1_macro"])
 
     # Infer model signature and log the model
     signature = infer_signature(
