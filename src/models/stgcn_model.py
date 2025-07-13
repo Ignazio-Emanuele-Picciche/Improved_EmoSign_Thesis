@@ -1,8 +1,52 @@
 import torch
 import torch.nn as nn
+import numpy as np
 
-# Requires torch_geometric for graph convolutions
-# from torch_geometric.nn import GCNConv, TemporalConv
+
+# Perché ST-GCN (Spatial-Temporal Graph Convolutional Network)?
+
+# Modellazione Spaziale: A differenza di un LSTM che tratta i landmark come una lunga
+# sequenza di feature, un ST-GCN modella esplicitamente le connessioni fisiche dello scheletro umano
+# (es. il gomito è connesso alla spalla e al polso).
+# Questo permette al modello di apprendere pattern basati sulla struttura corporea,
+# che sono fondamentali per interpretare il linguaggio del corpo e le emozioni.
+
+# Stato dell'Arte: Gli ST-GCN e le loro varianti sono considerati lo stato dell'arte
+# per problemi di action recognition e analisi del movimento basati su dati scheletrici.
+# Applicarli al riconoscimento delle emozioni è un'estensione potente e moderna.
+
+
+def get_adjacency_matrix(num_nodes, self_connection=True):
+    """
+    Generates a normalized adjacency matrix for OpenPose-like skeleton with 25 keypoints.
+    """
+    # OpenPose BODY_25 keypoint connections
+    # fmt: off
+    pairs = [
+        (0, 1), (1, 2), (2, 3), (3, 4), (1, 5), (5, 6), (6, 7), (1, 8),
+        (8, 9), (9, 10), (10, 11), (8, 12), (12, 13), (13, 14), (0, 15),
+        (15, 17), (0, 16), (16, 18), (11, 24), (24, 23), (23, 22),
+        (14, 21), (21, 20), (20, 19)
+    ]
+    # fmt: on
+
+    A = np.zeros((num_nodes, num_nodes))
+    for i, j in pairs:
+        if i < num_nodes and j < num_nodes:
+            A[i, j] = 1
+            A[j, i] = 1
+
+    if self_connection:
+        A += np.eye(num_nodes)
+
+    # Normalize the adjacency matrix
+    D = np.sum(A, axis=1)
+    D_inv_sqrt = np.power(D, -0.5)
+    D_inv_sqrt[np.isinf(D_inv_sqrt)] = 0.0
+    D_mat_inv_sqrt = np.diag(D_inv_sqrt)
+    A_norm = D_mat_inv_sqrt @ A @ D_mat_inv_sqrt
+
+    return torch.from_numpy(A_norm).float()
 
 
 class STGCNBlock(nn.Module):
@@ -56,15 +100,17 @@ class STGCN(nn.Module):
     Simplified ST-GCN for skeleton-based emotion recognition.
     """
 
-    def __init__(self, num_class, num_point, num_person=1, in_channels=3):
+    def __init__(self, num_class, num_point, num_person=1, in_channels=2):
         super().__init__()
-        # Define adjacency matrix A for the skeleton (you need to define a proper one)
-        A = torch.eye(num_point)
+        # Define and register adjacency matrix A for the skeleton
+        A = get_adjacency_matrix(num_point)
+        self.register_buffer("A", A)
+
         self.data_bn = nn.BatchNorm1d(num_person * in_channels * num_point)
         # Build multiple blocks with increasing channels
-        self.layer1 = STGCNBlock(in_channels, 64, A, residual=False)
-        self.layer2 = STGCNBlock(64, 128, A, stride=2)
-        self.layer3 = STGCNBlock(128, 256, A, stride=2)
+        self.layer1 = STGCNBlock(in_channels, 64, self.A, residual=False)
+        self.layer2 = STGCNBlock(64, 128, self.A, stride=2)
+        self.layer3 = STGCNBlock(128, 256, self.A, stride=2)
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(256, num_class)
 
