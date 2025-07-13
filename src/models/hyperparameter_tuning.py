@@ -1,5 +1,5 @@
-# python src/models/hyperparameter_tuning.py --model_type lstm --n_trials 15 --num_epochs 20
-# python src/models/hyperparameter_tuning.py --model_type lstm --n_trials 40 --num_epochs 40
+# python3 src/models/hyperparameter_tuning.py --model_type lstm --n_trials 15 --num_epochs 20
+# python3 src/models/hyperparameter_tuning.py --model_type lstm --n_trials 40 --num_epochs 40
 # mlflow server --host 127.0.0.1 --port 8080
 
 import os

@@ -1,15 +1,15 @@
 # mlflow server --host 127.0.0.1 --port 8080
 
-# PANORAMICA DEL FLUSSO:
 
-# python src/models/run_train.py \
+# python3 src/models/run_train.py \
 #   --model_type lstm \
-#   --batch_size 64 \
-#   --hidden_size 512 \
-#   --num_layers 2 \
-#   --learning_rate 0.0012830838516502473 \
-#   --dropout 0.0005204106154637622 \
-#   --num_epochs 50
+#   --batch_size 128 \
+#   --hidden_size 896 \
+#   --num_layers 5 \
+#   --learning_rate 1.0677482709481361e-05 \
+#   --dropout 0.23993475643167195 \
+#   --num_epochs 100
+
 
 import torch
 import torch.nn as nn
@@ -22,6 +22,13 @@ import mlflow
 import mlflow.pytorch
 from mlflow.models.signature import infer_signature
 import requests  # for pinging MLflow server
+
+
+# Aggiungi il percorso base del progetto al PYTHONPATH
+BASE_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
+)
+sys.path.insert(0, BASE_DIR)
 
 # Ignite imports
 # Workaround for MPS OOM: disable MPS upper memory limit (may risk system stability)
