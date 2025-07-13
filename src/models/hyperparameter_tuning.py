@@ -70,11 +70,17 @@ PATIENCE = 5  # early stopping patience
 
 def objective(trial):
     # Suggest hyperparameters (range affinati in base ai risultati precedenti)
-    hidden_size = trial.suggest_int("hidden_size", 128, 2048, step=128)
-    num_layers = trial.suggest_int("num_layers", 1, 10)
-    dropout = trial.suggest_float("dropout", 0.0, 0.5)
-    learning_rate = trial.suggest_loguniform("learning_rate", 1e-5, 1e-2)
-    batch_size = trial.suggest_categorical("batch_size", [16, 32, 64, 128, 256])
+    # hidden_size = trial.suggest_int("hidden_size", 128, 2048, step=128)
+    # num_layers = trial.suggest_int("num_layers", 1, 10)
+    # dropout = trial.suggest_float("dropout", 0.0, 0.5)
+    # learning_rate = trial.suggest_loguniform("learning_rate", 1e-5, 1e-2)
+    # batch_size = trial.suggest_categorical("batch_size", [16, 32, 64, 128, 256])
+
+    hidden_size = trial.suggest_int("hidden_size", 768, 1024, step=32)
+    num_layers = trial.suggest_int("num_layers", 2, 5)
+    dropout = trial.suggest_float("dropout", 0.2, 0.4)
+    learning_rate = trial.suggest_loguniform("learning_rate", 1e-6, 1e-4)
+    batch_size = trial.suggest_categorical("batch_size", [64, 96, 128, 160])
 
     # Load data
     train_dataset = LandmarkDataset(
