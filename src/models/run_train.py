@@ -55,25 +55,6 @@ from src.models.stgcn_model import STGCN  # Aggiunto per ST-GCN support
 from torch.backends import cudnn
 import random
 
-# --- Sezione 1: Definizione dei Parametri e Iperparametri ---
-# Percorsi dei file e delle cartelle
-LANDMARKS_DIR = os.path.join(
-    BASE_DIR, "data", "raw", "train", "openpose_output_train", "json"
-)
-PROCESSED_FILE = os.path.join(
-    BASE_DIR, "data", "processed", "train", "video_sentiment_data_0.65.csv"
-)
-
-# Percorsi specifici per train e validation
-TRAIN_LANDMARKS_DIR = LANDMARKS_DIR
-TRAIN_PROCESSED_FILE = PROCESSED_FILE
-VAL_LANDMARKS_DIR = os.path.join(
-    BASE_DIR, "data", "raw", "val", "openpose_output_val", "json"
-)
-VAL_PROCESSED_FILE = os.path.join(
-    BASE_DIR, "data", "processed", "val", "video_sentiment_data_0.65.csv"
-)
-
 
 def main(args):
     """Main training and evaluation function."""
@@ -156,35 +137,64 @@ def main(args):
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=3)
 
     trainer = create_supervised_trainer(model, optimizer, criterion, device=device)
-    evaluator = create_supervised_evaluator(
-        model,
-        metrics={
-            "val_loss": Loss(criterion, device="cpu"),
-            "val_acc": Accuracy(device="cpu"),
-        },
-        device=device,
-    )
+
+    # --- Sezione 4: Definizione delle Metriche e Handlers ---
+    # Definisci le metriche per l'evaluator
+    val_metrics = {
+        "val_loss": Loss(criterion, device="cpu"),
+        "val_acc": Accuracy(device="cpu"),
+    }
+
+    evaluator = create_supervised_evaluator(model, metrics=val_metrics, device=device)
+
+    # Funzione per calcolare e aggiungere F1 score alle metriche
+    @evaluator.on(Events.COMPLETED)
+    def compute_f1_scores(engine):
+        y_true, y_pred = [], []
+        model.eval()
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device)
+                outputs = model(xb.float())
+                preds = torch.argmax(outputs, dim=1)
+                y_true.extend(yb.cpu().numpy())
+                y_pred.extend(preds.cpu().numpy())
+
+        # Calcola le metriche F1
+        f1_macro = f1_score(y_true, y_pred, average="macro", zero_division=0)
+        f1_weighted = f1_score(y_true, y_pred, average="weighted", zero_division=0)
+        f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
+
+        # Aggiungi le metriche allo stato dell'evaluator
+        engine.state.metrics["val_f1_macro"] = f1_macro
+        engine.state.metrics["val_f1"] = f1_weighted
+        engine.state.metrics["val_f1_class_0"] = float(f1_per_class[0])
+        engine.state.metrics["val_f1_class_1"] = (
+            float(f1_per_class[1]) if len(f1_per_class) > 1 else 0.0
+        )
 
     # Handlers
+    # ModelCheckpoint ora usa val_f1_macro per salvare il modello migliore
     checkpoint_handler = ModelCheckpoint(
         dirname=os.path.join(BASE_DIR, "models"),
         filename_prefix=f"emotion_{args.model_type}",
         n_saved=1,
         create_dir=True,
         require_empty=False,
-        score_function=lambda eng: -eng.state.metrics["val_loss"],
-        score_name="val_loss",
+        score_function=lambda eng: eng.state.metrics["val_f1_macro"],
+        score_name="val_f1_macro",
     )
     evaluator.add_event_handler(Events.COMPLETED, checkpoint_handler, {"model": model})
 
+    # EarlyStopping ora usa val_f1_macro per decidere quando fermarsi
     earlystop_handler = IgniteEarlyStopping(
         patience=args.patience,
-        score_function=lambda eng: -eng.state.metrics["val_loss"],
+        score_function=lambda eng: eng.state.metrics["val_f1_macro"],
         trainer=trainer,
     )
     evaluator.add_event_handler(Events.COMPLETED, earlystop_handler)
 
-    # --- Sezione 4: Ciclo di Addestramento ---
+    # --- Sezione 5: Ciclo di Addestramento ---
     print("Inizio training con validazione (Ignite)...")
     run_name = f"EmotionRecognition_{args.model_type}_train"
 
@@ -216,24 +226,13 @@ def main(args):
                     train_loss_sum += loss.item() * xb.size(0)
             train_loss = train_loss_sum / len(train_loader.dataset)
 
+            # Esegui l'evaluator per calcolare tutte le metriche (inclusi F1 scores)
             evaluator.run(val_loader)
             metrics = evaluator.state.metrics
             val_loss = metrics["val_loss"]
             val_acc = metrics["val_acc"]
-            # Compute F1 manually on CPU to avoid MPS float64 errors
-            y_true, y_pred = [], []
-            model.eval()
-            with torch.no_grad():
-                for xb, yb in val_loader:
-                    xb = xb.to(device)
-                    outputs = model(xb.float())  # No need for yb on device here
-                    preds = torch.argmax(outputs, dim=1)
-                    y_true.extend(yb.cpu().numpy())
-                    y_pred.extend(preds.cpu().numpy())
-            val_f1 = f1_score(y_true, y_pred, average="weighted")
-            # Compute macro F1 and per-class F1
-            val_f1_macro = f1_score(y_true, y_pred, average="macro")
-            f1_per_class = f1_score(y_true, y_pred, average=None)
+            val_f1 = metrics["val_f1"]
+            val_f1_macro = metrics["val_f1_macro"]
 
             # Update best metrics
             if val_loss < best_metrics["val_loss"]:
@@ -250,17 +249,15 @@ def main(args):
                     "val_acc": val_acc,
                     "val_f1": val_f1,
                     "val_f1_macro": val_f1_macro,
-                    "val_f1_class_0": float(f1_per_class[0]),
-                    "val_f1_class_1": (
-                        float(f1_per_class[1]) if len(f1_per_class) > 1 else None
-                    ),
+                    "val_f1_class_0": metrics["val_f1_class_0"],
+                    "val_f1_class_1": metrics["val_f1_class_1"],
                 },
                 step=engine.state.epoch,
             )
             print(
                 f"Epoch {engine.state.epoch}/{args.num_epochs}, "
                 f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
-                f"Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f}"
+                f"Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f}, Val F1 Macro: {val_f1_macro:.4f}"
             )
             scheduler.step(val_loss)
 

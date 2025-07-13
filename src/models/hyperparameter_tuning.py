@@ -132,6 +132,31 @@ def objective(trial):
         device=device,
     )
 
+    # Funzione per calcolare e aggiungere F1 score alle metriche
+    @evaluator.on(Events.COMPLETED)
+    def compute_f1_scores(engine):
+        y_true, y_pred = [], []
+        model.eval()
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                if MODEL_TYPE == "stgcn":
+                    b, t, f = xb.shape
+                    xb = xb.view(b, t, -1, 2)
+                xb = xb.to(device)
+                outputs = model(xb.float())
+                preds = torch.argmax(outputs, dim=1)
+                y_true.extend(yb.cpu().numpy())
+                y_pred.extend(preds.cpu().numpy())
+        f1_macro = f1_score(y_true, y_pred, average="macro")
+        f1_weighted = f1_score(y_true, y_pred, average="weighted")
+        f1_per_class = f1_score(y_true, y_pred, average=None)
+        engine.state.metrics["val_f1_macro"] = f1_macro
+        engine.state.metrics["val_f1"] = f1_weighted
+        engine.state.metrics["val_f1_class_0"] = float(f1_per_class[0])
+        engine.state.metrics["val_f1_class_1"] = (
+            float(f1_per_class[1]) if len(f1_per_class) > 1 else 0.0
+        )
+
     # nested MLflow run per trial
     with mlflow.start_run(nested=True):
         params = {
@@ -161,27 +186,15 @@ def objective(trial):
                     loss = criterion(outputs, yb)
                     train_loss_sum += loss.item() * xb.size(0)
             train_loss = train_loss_sum / len(train_loader.dataset)
+
+            # Esegui evaluator per calcolare tutte le metriche (loss, acc, e F1)
             evaluator.run(val_loader)
             metrics = evaluator.state.metrics
             val_loss = metrics["val_loss"]
             val_acc = metrics["val_acc"]
+            val_f1 = metrics["val_f1"]
+            val_f1_macro = metrics["val_f1_macro"]
 
-            y_true, y_pred = [], []
-            model.eval()
-            with torch.no_grad():
-                for xb, yb in val_loader:
-                    if MODEL_TYPE == "stgcn":
-                        b, t, f = xb.shape
-                        xb = xb.view(b, t, -1, 2)
-                    xb = xb.to(device)
-                    outputs = model(xb.float())
-                    preds = torch.argmax(outputs, dim=1)
-                    y_true.extend(yb.cpu().numpy())
-                    y_pred.extend(preds.cpu().numpy())
-            val_f1 = f1_score(y_true, y_pred, average="weighted")
-            # Compute macro F1 and per-class F1
-            val_f1_macro = f1_score(y_true, y_pred, average="macro")
-            f1_per_class = f1_score(y_true, y_pred, average=None)
             # Update best macro F1
             if val_f1_macro > best_metrics["val_f1_macro"]:
                 best_metrics["val_f1_macro"] = val_f1_macro
@@ -198,10 +211,8 @@ def objective(trial):
                     "val_acc": val_acc,
                     "val_f1": val_f1,
                     "val_f1_macro": val_f1_macro,
-                    "val_f1_class_0": float(f1_per_class[0]),
-                    "val_f1_class_1": (
-                        float(f1_per_class[1]) if len(f1_per_class) > 1 else None
-                    ),
+                    "val_f1_class_0": metrics["val_f1_class_0"],
+                    "val_f1_class_1": metrics["val_f1_class_1"],
                 },
                 step=engine.state.epoch,
             )
@@ -212,14 +223,14 @@ def objective(trial):
             elif device.type == "mps":
                 torch.mps.empty_cache()
 
-        # Optuna pruner
-        pruning_handler = PyTorchIgnitePruningHandler(trial, "val_loss", trainer)
+        # Optuna pruner: ora monitora val_f1_macro
+        pruning_handler = PyTorchIgnitePruningHandler(trial, "val_f1_macro", trainer)
         evaluator.add_event_handler(Events.COMPLETED, pruning_handler)
 
-        # Early stopping
+        # Early stopping: ora monitora val_f1_macro
         early_stopper = IgniteEarlyStopping(
             patience=PATIENCE,
-            score_function=lambda eng: -eng.state.metrics["val_loss"],
+            score_function=lambda eng: eng.state.metrics["val_f1_macro"],
             trainer=trainer,
         )
         evaluator.add_event_handler(Events.COMPLETED, early_stopper)
@@ -247,7 +258,8 @@ def objective(trial):
             torch.cuda.empty_cache()
         elif device.type == "mps":
             torch.mps.empty_cache()
-        return best_metrics["val_loss"]
+        # Restituisce la metrica da ottimizzare (massimizzare)
+        return best_metrics["val_f1_macro"]
 
 
 def main():
@@ -285,7 +297,7 @@ def main():
         # Log seed used for reproducibility
         mlflow.log_param("seed", seed)
         study = optuna.create_study(
-            direction="minimize",
+            direction="maximize",  # Cambiato a "maximize" per f1_macro
             pruner=MedianPruner(n_startup_trials=PATIENCE, n_warmup_steps=1),
             sampler=TPESampler(seed=seed),
         )
@@ -293,7 +305,7 @@ def main():
         # Log global tuning info
         mlflow.log_param("n_trials", args.n_trials)
         mlflow.log_params(study.best_trial.params)
-        mlflow.log_metric("best_val_loss", study.best_value)
+        mlflow.log_metric("best_val_f1_macro_study", study.best_value)
         mlflow.set_tags(
             {
                 "project": "EmoSign",
