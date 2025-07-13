@@ -8,7 +8,7 @@ import argparse
 import optuna
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import numpy as np
 from sklearn.metrics import f1_score
 import mlflow
@@ -112,10 +112,28 @@ def objective(trial):
     val_dataset = LandmarkDataset(
         landmarks_dir=VAL_LANDMARKS_DIR, processed_file=VAL_PROCESSED_FILE
     )
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size)
 
-    # Class weights
+    # --- Weighted Sampler for Handling Class Imbalance ---
+    # Create a sampler to ensure each batch has a balanced representation of classes.
+    # This is a powerful technique to force the model to learn from the minority class.
+    labels_arr = train_dataset.processed["emotion"].map(train_dataset.label_map).values
+    class_counts = np.bincount(labels_arr)
+    class_weights_for_sampler = 1.0 / class_counts
+    sample_weights = np.array(
+        [class_weights_for_sampler[label] for label in labels_arr]
+    )
+    sampler = WeightedRandomSampler(
+        weights=torch.from_numpy(sample_weights).double(),
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+
+    # When using a sampler, shuffle must be False. The sampler handles the random sampling.
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+    # The validation loader remains unchanged to evaluate on the real, imbalanced data distribution.
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    # Class weights for the loss function (acts as a secondary balancing mechanism)
     labels_arr = train_dataset.processed["emotion"].map(train_dataset.label_map).values
     counts = np.bincount(labels_arr)
     weights = [len(labels_arr) / (len(counts) * c) for c in counts]
@@ -150,7 +168,10 @@ def objective(trial):
 
     criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=3)
+    # scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=3)  # NOTE Old: monitors val_loss
+    scheduler = ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.1, patience=3
+    )  # NOTE New: monitors val_f1_macro
 
     # Use the custom prepare_batch function for trainers and evaluators
     trainer = create_supervised_trainer(
@@ -245,7 +266,10 @@ def objective(trial):
                 },
                 step=engine.state.epoch,
             )
-            scheduler.step(val_loss)
+            # scheduler.step(val_loss)  # NOTE Old: monitors val_loss
+            scheduler.step(
+                val_f1_macro
+            )  # NOTE New: monitors val_f1_macro to better handle imbalance
             # Clear GPU/MPS cache to prevent OOM
             if device.type == "cuda":
                 torch.cuda.empty_cache()

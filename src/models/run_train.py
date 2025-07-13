@@ -25,7 +25,7 @@
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from sklearn.metrics import f1_score
 import numpy as np
 import os, sys
@@ -121,10 +121,31 @@ def main(args):
         landmarks_dir=VAL_LANDMARKS_DIR, processed_file=VAL_PROCESSED_FILE
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    # --- Weighted Sampler for Handling Class Imbalance ---
+    # Create a sampler to ensure each batch has a balanced representation of classes.
+    # This is a powerful technique to force the model to learn from the minority class.
+    labels_arr_sampler = (
+        train_dataset.processed["emotion"].map(train_dataset.label_map).values
+    )
+    class_counts_sampler = np.bincount(labels_arr_sampler)
+    class_weights_for_sampler = 1.0 / class_counts_sampler
+    sample_weights = np.array(
+        [class_weights_for_sampler[label] for label in labels_arr_sampler]
+    )
+    sampler = WeightedRandomSampler(
+        weights=torch.from_numpy(sample_weights).double(),
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+
+    # When using a sampler, shuffle must be False. The sampler handles the random sampling.
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, sampler=sampler
+    )
+    # The validation loader remains unchanged to evaluate on the real, imbalanced data distribution.
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
-    # Bilanciamento classi
+    # Bilanciamento classi per la funzione di loss (meccanismo secondario)
     labels_array = (
         train_dataset.processed["emotion"].map(train_dataset.label_map).values
     )
@@ -152,7 +173,10 @@ def main(args):
 
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=3)
+    # scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=3) # NOTE Old: monitors val_loss
+    scheduler = ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.1, patience=3
+    )  # NOTE New: monitors val_f1_macro
 
     # Use a lambda to pass model_type to prepare_batch
     prepare_batch_fn = lambda batch, device, non_blocking: prepare_batch(
@@ -293,7 +317,10 @@ def main(args):
                 f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
                 f"Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f}, Val F1 Macro: {val_f1_macro:.4f}"
             )
-            scheduler.step(val_loss)
+            # scheduler.step(val_loss) # NOTE Old: monitors val_loss
+            scheduler.step(
+                val_f1_macro
+            )  # NOTE New: monitors val_f1_macro to better handle imbalance
 
             # Clear cache
             if device.type == "cuda":
