@@ -68,19 +68,42 @@ MODEL_TYPE = "lstm"
 PATIENCE = 5  # early stopping patience
 
 
-def objective(trial):
-    # Suggest hyperparameters (range affinati in base ai risultati precedenti)
-    # hidden_size = trial.suggest_int("hidden_size", 128, 2048, step=128)
-    # num_layers = trial.suggest_int("num_layers", 1, 10)
-    # dropout = trial.suggest_float("dropout", 0.0, 0.5)
-    # learning_rate = trial.suggest_loguniform("learning_rate", 1e-5, 1e-2)
-    # batch_size = trial.suggest_categorical("batch_size", [16, 32, 64, 128, 256])
+def prepare_batch(batch, device, non_blocking=False):
+    """Prepare batch for training: move to device and reshape for ST-GCN."""
+    x, y = batch
+    if MODEL_TYPE == "stgcn":
+        # Reshape input from (B, T, F) to (B, T, N, C)
+        # B=batch, T=time, F=features, N=num_points, C=channels
+        b, t, f = x.shape
+        coords_per_point = 2
+        num_point = f // coords_per_point
+        x = x.view(b, t, num_point, coords_per_point)
+    return (
+        x.to(device, non_blocking=non_blocking),
+        y.to(device, non_blocking=non_blocking),
+    )
 
-    hidden_size = trial.suggest_int("hidden_size", 768, 1024, step=32)
-    num_layers = trial.suggest_int("num_layers", 2, 5)
-    dropout = trial.suggest_float("dropout", 0.2, 0.4)
-    learning_rate = trial.suggest_loguniform("learning_rate", 1e-6, 1e-4)
-    batch_size = trial.suggest_categorical("batch_size", [64, 96, 128, 160])
+
+def objective(trial):
+    # --- Hyperparameter suggestion based on model type ---
+    if MODEL_TYPE == "lstm":
+        # Search space for LSTM
+        hidden_size = trial.suggest_int("hidden_size", 768, 1024, step=32)
+        num_layers = trial.suggest_int("num_layers", 2, 5)
+        dropout = trial.suggest_float("dropout", 0.2, 0.5)
+        learning_rate = trial.suggest_loguniform("learning_rate", 1e-6, 1e-4)
+        batch_size = trial.suggest_categorical("batch_size", [64, 96, 128, 160])
+        params_to_log = {
+            "hidden_size": hidden_size,
+            "num_layers": num_layers,
+            "dropout": dropout,
+        }
+    else:  # stgcn
+        # Search space for ST-GCN
+        learning_rate = trial.suggest_loguniform("learning_rate", 1e-5, 1e-2)
+        batch_size = trial.suggest_categorical("batch_size", [16, 32, 64, 128])
+        dropout = trial.suggest_float("dropout", 0.1, 0.7)
+        params_to_log = {"stgcn_dropout": dropout}
 
     # Load data
     train_dataset = LandmarkDataset(
@@ -118,18 +141,26 @@ def objective(trial):
         coords_per_point = 2
         num_point = input_size // coords_per_point
         model = STGCN(
-            num_classes, num_point, num_person=1, in_channels=coords_per_point
+            num_classes,
+            num_point,
+            num_person=1,
+            in_channels=coords_per_point,
+            dropout_rate=dropout,
         ).to(device)
 
     criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=3)
 
-    trainer = create_supervised_trainer(model, optimizer, criterion, device=device)
+    # Use the custom prepare_batch function for trainers and evaluators
+    trainer = create_supervised_trainer(
+        model, optimizer, criterion, device=device, prepare_batch=prepare_batch
+    )
     evaluator = create_supervised_evaluator(
         model,
         metrics={"val_loss": Loss(criterion), "val_acc": Accuracy()},
         device=device,
+        prepare_batch=prepare_batch,
     )
 
     # Funzione per calcolare e aggiungere F1 score alle metriche
@@ -139,17 +170,15 @@ def objective(trial):
         model.eval()
         with torch.no_grad():
             for xb, yb in val_loader:
-                if MODEL_TYPE == "stgcn":
-                    b, t, f = xb.shape
-                    xb = xb.view(b, t, -1, 2)
-                xb = xb.to(device)
+                # Reshaping is now handled by prepare_batch, so we pass the original batch
+                xb, yb = prepare_batch((xb, yb), device)
                 outputs = model(xb.float())
                 preds = torch.argmax(outputs, dim=1)
                 y_true.extend(yb.cpu().numpy())
                 y_pred.extend(preds.cpu().numpy())
-        f1_macro = f1_score(y_true, y_pred, average="macro")
-        f1_weighted = f1_score(y_true, y_pred, average="weighted")
-        f1_per_class = f1_score(y_true, y_pred, average=None)
+        f1_macro = f1_score(y_true, y_pred, average="macro", zero_division=0)
+        f1_weighted = f1_score(y_true, y_pred, average="weighted", zero_division=0)
+        f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
         engine.state.metrics["val_f1_macro"] = f1_macro
         engine.state.metrics["val_f1"] = f1_weighted
         engine.state.metrics["val_f1_class_0"] = float(f1_per_class[0])
@@ -159,15 +188,14 @@ def objective(trial):
 
     # nested MLflow run per trial
     with mlflow.start_run(nested=True):
-        params = {
-            "hidden_size": hidden_size,
-            "num_layers": num_layers,
-            "dropout": dropout,
+        # Log common and model-specific parameters
+        base_params = {
             "learning_rate": learning_rate,
             "batch_size": batch_size,
             "model_type": MODEL_TYPE,
         }
-        mlflow.log_params(params)
+        mlflow.log_params({**base_params, **params_to_log})
+
         # Log mapping from class indices to emotion labels
         class_map = {i: label for i, label in enumerate(train_dataset.labels)}
         mlflow.log_params({f"class_{i}": label for i, label in class_map.items()})
@@ -181,7 +209,8 @@ def objective(trial):
             train_loss_sum = 0.0
             with torch.no_grad():
                 for xb, yb in train_loader:
-                    xb, yb = xb.to(device), yb.to(device)
+                    # Reshaping is now handled by prepare_batch
+                    xb, yb = prepare_batch((xb, yb), device)
                     outputs = model(xb.float())
                     loss = criterion(outputs, yb)
                     train_loss_sum += loss.item() * xb.size(0)

@@ -2,6 +2,7 @@
 
 
 # python src/models/run_train.py \
+#   --model_type lstm \
 #   --batch_size 128 \
 #   --hidden_size 896 \
 #   --num_layers 5 \
@@ -10,8 +11,9 @@
 #   --num_epochs 100 \
 #   --seed 44
 
-# BEST
+# BEST lstm model params:
 # python src/models/run_train.py \
+#   --model_type lstm \
 #   --batch_size 128 \
 #   --hidden_size 896 \
 #   --num_layers 3 \
@@ -54,6 +56,22 @@ from src.models.lstm_model import EmotionLSTM  # Importa l'architettura del mode
 from src.models.stgcn_model import STGCN  # Aggiunto per ST-GCN support
 from torch.backends import cudnn
 import random
+
+
+def prepare_batch(batch, device, model_type, non_blocking=False):
+    """Prepare batch for training: move to device and reshape for ST-GCN."""
+    x, y = batch
+    if model_type == "stgcn":
+        # Reshape input from (B, T, F) to (B, T, N, C)
+        # B=batch, T=time, F=features, N=num_points, C=channels
+        b, t, f = x.shape
+        coords_per_point = 2
+        num_point = f // coords_per_point
+        x = x.view(b, t, num_point, coords_per_point)
+    return (
+        x.to(device, non_blocking=non_blocking),
+        y.to(device, non_blocking=non_blocking),
+    )
 
 
 def main(args):
@@ -136,7 +154,14 @@ def main(args):
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=3)
 
-    trainer = create_supervised_trainer(model, optimizer, criterion, device=device)
+    # Use a lambda to pass model_type to prepare_batch
+    prepare_batch_fn = lambda batch, device, non_blocking: prepare_batch(
+        batch, device, args.model_type, non_blocking
+    )
+
+    trainer = create_supervised_trainer(
+        model, optimizer, criterion, device=device, prepare_batch=prepare_batch_fn
+    )
 
     # --- Sezione 4: Definizione delle Metriche e Handlers ---
     # Definisci le metriche per l'evaluator
@@ -145,7 +170,9 @@ def main(args):
         "val_acc": Accuracy(device="cpu"),
     }
 
-    evaluator = create_supervised_evaluator(model, metrics=val_metrics, device=device)
+    evaluator = create_supervised_evaluator(
+        model, metrics=val_metrics, device=device, prepare_batch=prepare_batch_fn
+    )
 
     # Funzione per calcolare e aggiungere F1 score alle metriche
     @evaluator.on(Events.COMPLETED)
@@ -154,7 +181,8 @@ def main(args):
         model.eval()
         with torch.no_grad():
             for xb, yb in val_loader:
-                xb = xb.to(device)
+                # Reshaping is now handled by prepare_batch
+                xb, yb = prepare_batch_fn((xb, yb), device, non_blocking=False)
                 outputs = model(xb.float())
                 preds = torch.argmax(outputs, dim=1)
                 y_true.extend(yb.cpu().numpy())
@@ -199,17 +227,22 @@ def main(args):
     run_name = f"EmotionRecognition_{args.model_type}_train"
 
     with mlflow.start_run(run_name=run_name) as run:
+        # Log only relevant parameters
         params = {
             "model_type": args.model_type,
-            "hidden_size": args.hidden_size,
-            "num_layers": args.num_layers,
             "batch_size": args.batch_size,
             "num_epochs": args.num_epochs,
             "learning_rate": args.learning_rate,
             "patience": args.patience,
-            "dropout": args.dropout,
             "seed": args.seed,
         }
+        if args.model_type == "lstm":
+            params["hidden_size"] = args.hidden_size
+            params["num_layers"] = args.num_layers
+            params["dropout"] = args.dropout
+        else:  # stgcn
+            params["stgcn_dropout"] = args.dropout
+
         mlflow.log_params(params)
         best_metrics = {"val_loss": float("inf"), "val_f1": 0.0, "val_f1_macro": 0.0}
 
@@ -220,7 +253,8 @@ def main(args):
             train_loss_sum = 0.0
             with torch.no_grad():
                 for xb, yb in train_loader:
-                    xb, yb = xb.to(device), yb.to(device)
+                    # Reshaping is now handled by prepare_batch
+                    xb, yb = prepare_batch_fn((xb, yb), device, non_blocking=False)
                     outputs = model(xb.float())
                     loss = criterion(outputs, yb)
                     train_loss_sum += loss.item() * xb.size(0)
@@ -281,9 +315,12 @@ def main(args):
         # Infer model signature and log the model
         # Get a single batch from the train_loader to infer signature
         data_sample, _ = next(iter(train_loader))
+        # Reshape sample for ST-GCN if necessary
+        data_sample, _ = prepare_batch_fn((data_sample, _), device, non_blocking=False)
+
         signature = infer_signature(
-            data_sample.numpy(),
-            model(data_sample.to(device).float()).cpu().detach().numpy(),
+            data_sample.cpu().numpy(),
+            model(data_sample.float()).cpu().detach().numpy(),
         )
         mlflow.pytorch.log_model(
             pytorch_model=model,

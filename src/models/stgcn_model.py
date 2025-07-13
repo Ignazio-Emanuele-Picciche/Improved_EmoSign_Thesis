@@ -116,7 +116,9 @@ class STGCN(nn.Module):
     6. Fully Connected Layer: A final linear layer for classification into emotion classes.
     """
 
-    def __init__(self, num_class, num_point, num_person=1, in_channels=2):
+    def __init__(
+        self, num_class, num_point, num_person=1, in_channels=2, dropout_rate=0.5
+    ):
         super().__init__()
         # Define and register adjacency matrix A for the skeleton
         A = get_adjacency_matrix(num_point)
@@ -128,6 +130,7 @@ class STGCN(nn.Module):
         self.layer2 = STGCNBlock(64, 128, self.A, stride=2)
         self.layer3 = STGCNBlock(128, 256, self.A, stride=2)
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout = nn.Dropout(dropout_rate)
         self.fc = nn.Linear(256, num_class)
 
     def forward(self, x):
@@ -144,4 +147,5 @@ class STGCN(nn.Module):
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.pool(x).view(b, -1)
+        x = self.dropout(x)
         return self.fc(x)
