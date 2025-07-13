@@ -98,6 +98,22 @@ class STGCNBlock(nn.Module):
 class STGCN(nn.Module):
     """
     Simplified ST-GCN for skeleton-based emotion recognition.
+
+    The model structure is as follows:
+    1. Input Batch Normalization: Normalizes the raw input skeleton data across
+       all nodes and channels for each frame.
+    2. ST-GCN Block 1: Processes the input data with 64 feature channels.
+       - Spatial convolution using the adjacency matrix to learn spatial patterns.
+       - Temporal convolution to capture motion patterns.
+    3. ST-GCN Block 2: Increases feature channels to 128 and downsamples the
+       temporal dimension by a factor of 2 (stride=2), capturing features at a
+       larger time scale.
+    4. ST-GCN Block 3: Further increases features to 256 and downsamples
+       the temporal dimension again, creating a compact and high-level feature
+       representation.
+    5. Global Average Pooling: Aggregates features across all nodes and time steps
+       to produce a single feature vector for each sample in the batch.
+    6. Fully Connected Layer: A final linear layer for classification into emotion classes.
     """
 
     def __init__(self, num_class, num_point, num_person=1, in_channels=2):
