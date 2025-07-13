@@ -221,8 +221,9 @@ def main(args):
                     y_true.extend(yb.cpu().numpy())
                     y_pred.extend(preds.cpu().numpy())
             val_f1 = f1_score(y_true, y_pred, average="weighted")
-            # Compute macro F1
+            # Compute macro F1 and per-class F1
             val_f1_macro = f1_score(y_true, y_pred, average="macro")
+            f1_per_class = f1_score(y_true, y_pred, average=None)
 
             # Update best metrics
             if val_loss < best_metrics["val_loss"]:
@@ -239,6 +240,10 @@ def main(args):
                     "val_acc": val_acc,
                     "val_f1": val_f1,
                     "val_f1_macro": val_f1_macro,
+                    "val_f1_class_0": float(f1_per_class[0]),
+                    "val_f1_class_1": (
+                        float(f1_per_class[1]) if len(f1_per_class) > 1 else None
+                    ),
                 },
                 step=engine.state.epoch,
             )
