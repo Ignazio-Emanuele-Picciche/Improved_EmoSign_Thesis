@@ -23,7 +23,6 @@ import mlflow.pytorch
 from mlflow.models.signature import infer_signature
 import requests  # for pinging MLflow server
 
-
 # Aggiungi il percorso base del progetto al PYTHONPATH
 BASE_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
@@ -36,12 +35,13 @@ os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
 from ignite.engine import Events, create_supervised_trainer, create_supervised_evaluator
 from ignite.metrics import Loss, Accuracy
 from ignite.handlers import EarlyStopping as IgniteEarlyStopping, ModelCheckpoint
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from data_pipeline.landmark_dataset import (
+from src.data_pipeline.landmark_dataset import (
     LandmarkDataset,
 )  # Importa la classe per gestire i dati
-from models.lstm_model import EmotionLSTM  # Importa l'architettura del modello LSTM
-from models.stgcn_model import STGCN  # Aggiunto per ST-GCN support
+from src.models.lstm_model import EmotionLSTM  # Importa l'architettura del modello LSTM
+from src.models.stgcn_model import STGCN  # Aggiunto per ST-GCN support
 from torch.backends import cudnn
 import random
 
@@ -63,35 +63,6 @@ VAL_LANDMARKS_DIR = os.path.join(
 VAL_PROCESSED_FILE = os.path.join(
     BASE_DIR, "data", "processed", "val", "video_sentiment_data_0.65.csv"
 )
-
-# Iperparametri
-# INPUT_SIZE = 468 * 3  # Calcolato dinamicamente dal dataset, non è più hard-coded
-HIDDEN_SIZE = 256  # Complessità del modello LSTM
-NUM_LAYERS = 2  # Profondità del modello LSTM
-# NUM_CLASSES = 7  # Numero di emozioni da predire (ora calcolato dinamicamente)
-BATCH_SIZE = 32  # Quanti video processare in parallelo prima di aggiornare il modello
-NUM_EPOCHS = 50  # Quante volte ripetere l'addestramento sull'intero dataset
-PATIENCE = 8  # Early stopping patience
-LEARNING_RATE = 0.001  # "Velocità" con cui il modello impara e si corregge
-DROP_OUT = 0.2  # Dropout rate to regularize
-
-# --- Sezione 1.5: Selezione del modello ---
-# Opzioni: 'lstm' (default) o 'stgcn'
-MODEL_TYPE = "lstm"  # Sostituisci con 'lstm' per LSTM basato su sentimen
-
-MODEL_SAVE_PATH = os.path.join(BASE_DIR, "models", f"emotion_{MODEL_TYPE}.pth")
-
-# Define hyperparameters dict for MLflow logging
-params = {
-    "model_type": MODEL_TYPE,
-    "hidden_size": HIDDEN_SIZE,
-    "num_layers": NUM_LAYERS,
-    "batch_size": BATCH_SIZE,
-    "num_epochs": NUM_EPOCHS,
-    "learning_rate": LEARNING_RATE,
-    "patience": PATIENCE,
-    "dropout": DROP_OUT,
-}
 
 
 def main(args):
@@ -121,9 +92,6 @@ def main(args):
 
     # --- Sezione 3: Caricamento Dati e Creazione del Modello ---
     # Data paths
-    BASE_DIR = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
-    )
     TRAIN_LANDMARKS_DIR = os.path.join(
         BASE_DIR, "data", "raw", "train", "openpose_output_train", "json"
     )
@@ -299,12 +267,11 @@ def main(args):
         mlflow.log_metric("best_val_f1_macro", best_metrics["val_f1_macro"])
 
         # Infer model signature and log the model
+        # Get a single batch from the train_loader to infer signature
+        data_sample, _ = next(iter(train_loader))
         signature = infer_signature(
-            train_dataset[0][0].numpy(),
-            model(train_dataset[0][0].unsqueeze(0).to(device).float())
-            .cpu()
-            .detach()
-            .numpy(),
+            data_sample.numpy(),
+            model(data_sample.to(device).float()).cpu().detach().numpy(),
         )
         mlflow.pytorch.log_model(
             pytorch_model=model,
@@ -327,7 +294,7 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--num_epochs", type=int, default=50)
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--patience", type=int, default=15)
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"
     )
