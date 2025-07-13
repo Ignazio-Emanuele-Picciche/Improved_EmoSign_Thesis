@@ -9,14 +9,19 @@ import optuna
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from sklearn.metrics import f1_score
 import numpy as np
+from sklearn.metrics import f1_score
 import mlflow
 import mlflow.pytorch
 from mlflow.models.signature import infer_signature
 from optuna.pruners import MedianPruner
+import random
+from torch.backends import cudnn
+from optuna.samplers import TPESampler
 
 # Ignite imports
+# Workaround for MPS OOM: disable MPS upper memory limit (may risk system stability)
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
 from ignite.engine import Events, create_supervised_trainer, create_supervised_evaluator
 from ignite.metrics import Loss, Accuracy
 from ignite.handlers import EarlyStopping as IgniteEarlyStopping, ModelCheckpoint
@@ -65,11 +70,11 @@ PATIENCE = 5  # early stopping patience
 
 def objective(trial):
     # Suggest hyperparameters (range affinati in base ai risultati precedenti)
-    hidden_size = trial.suggest_int("hidden_size", 256, 1024, step=128)
-    num_layers = trial.suggest_int("num_layers", 1, 6)
-    dropout = trial.suggest_float("dropout", 0.0, 0.2)
-    learning_rate = trial.suggest_loguniform("learning_rate", 5e-4, 5e-3)
-    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128])
+    hidden_size = trial.suggest_int("hidden_size", 128, 2048, step=128)
+    num_layers = trial.suggest_int("num_layers", 1, 10)
+    dropout = trial.suggest_float("dropout", 0.0, 0.5)
+    learning_rate = trial.suggest_loguniform("learning_rate", 1e-5, 1e-2)
+    batch_size = trial.suggest_categorical("batch_size", [16, 32, 64, 128, 256])
 
     # Load data
     train_dataset = LandmarkDataset(
@@ -195,6 +200,11 @@ def objective(trial):
                 step=engine.state.epoch,
             )
             scheduler.step(val_loss)
+            # Clear GPU/MPS cache to prevent OOM
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            elif device.type == "mps":
+                torch.mps.empty_cache()
 
         # Optuna pruner
         pruning_handler = PyTorchIgnitePruningHandler(trial, "val_loss", trainer)
@@ -226,6 +236,11 @@ def objective(trial):
                 # ),
             }
         )
+        # Clear cache after trial
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif device.type == "mps":
+            torch.mps.empty_cache()
         return best_metrics["val_loss"]
 
 
@@ -240,7 +255,20 @@ def main():
         "--n_trials", type=int, default=20, help="Number of Optuna trials"
     )
     parser.add_argument("--num_epochs", type=int, default=5, help="Epochs per trial")
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed for reproducibility"
+    )
     args = parser.parse_args()
+    # Set random seeds for reproducibility
+    seed = args.seed
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    cudnn.deterministic = True
+    cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True)
 
     global NUM_EPOCHS, MODEL_TYPE
     NUM_EPOCHS = args.num_epochs
@@ -248,9 +276,12 @@ def main():
     # Parent MLflow run per studio di ottimizzazione
     run_name = f"Optuna_{MODEL_TYPE}_tuning"
     with mlflow.start_run(run_name=run_name):
+        # Log seed used for reproducibility
+        mlflow.log_param("seed", seed)
         study = optuna.create_study(
             direction="minimize",
             pruner=MedianPruner(n_startup_trials=PATIENCE, n_warmup_steps=1),
+            sampler=TPESampler(seed=seed),
         )
         study.optimize(objective, n_trials=args.n_trials)
         # Log global tuning info
