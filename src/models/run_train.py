@@ -23,31 +23,20 @@ import mlflow.pytorch
 from mlflow.models.signature import infer_signature
 import requests  # for pinging MLflow server
 
-# Aggiunge la cartella src al PYTHONPATH per consentire import data e models
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
-# Definisce la root del progetto per percorsi assoluti
-BASE_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
-)
+# Ignite imports
+# Workaround for MPS OOM: disable MPS upper memory limit (may risk system stability)
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+from ignite.engine import Events, create_supervised_trainer, create_supervised_evaluator
+from ignite.metrics import Loss, Accuracy
+from ignite.handlers import EarlyStopping as IgniteEarlyStopping, ModelCheckpoint
 
 from data_pipeline.landmark_dataset import (
     LandmarkDataset,
 )  # Importa la classe per gestire i dati
 from models.lstm_model import EmotionLSTM  # Importa l'architettura del modello LSTM
 from models.stgcn_model import STGCN  # Aggiunto per ST-GCN support
-
-# Removed custom EarlyStopping; using Ignite handlers instead
-
-## Ignite imports for callback-based training
-from ignite.engine import Events, create_supervised_trainer, create_supervised_evaluator
-from ignite.metrics import Loss, Accuracy
-from ignite.handlers import EarlyStopping as IgniteEarlyStopping, ModelCheckpoint
-
-# Set our tracking server uri for logging
-mlflow.set_tracking_uri(uri="http://127.0.0.1:8080")
-
-# Create a new MLflow Experiment
-mlflow.set_experiment("Emotion Recognition Experiment")
+from torch.backends import cudnn
+import random
 
 # --- Sezione 1: Definizione dei Parametri e Iperparametri ---
 # Percorsi dei file e delle cartelle
@@ -98,224 +87,244 @@ params = {
 }
 
 
-# --- Sezione 2: Setup dell'Ambiente ---
-# Seleziona il dispositivo su cui eseguire i calcoli: Apple Silicon (mps) se disponibile, altrimenti GPU (cuda) o CPU.
-if torch.backends.mps.is_available():
-    device = torch.device("mps")
-elif torch.cuda.is_available():
-    device = torch.device("cuda")
-else:
-    device = torch.device("cpu")
-print(f"Training su dispositivo: {device}")
+def main(args):
+    """Main training and evaluation function."""
+    # --- Sezione 2: Setup dell'Ambiente ---
+    # Set random seeds for reproducibility
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    cudnn.deterministic = True
+    cudnn.benchmark = False
 
-# --- Sezione 3: Caricamento Dati e Creazione del Modello ---
-# 1. Crea un'istanza dei nostri Dataset per train e validation
-train_dataset = LandmarkDataset(
-    landmarks_dir=TRAIN_LANDMARKS_DIR, processed_file=TRAIN_PROCESSED_FILE
-)
-val_dataset = LandmarkDataset(
-    landmarks_dir=VAL_LANDMARKS_DIR, processed_file=VAL_PROCESSED_FILE
-)
+    # Seleziona il dispositivo su cui eseguire i calcoli
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    print(f"Training su dispositivo: {device}")
 
-# Rimuoviamo lo split e usiamo DataLoader separati
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-# Validation loader: no shuffle for reproducibility
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    # Set our tracking server uri for logging
+    mlflow.set_tracking_uri(uri="http://127.0.0.1:8080")
+    mlflow.set_experiment("Emotion Recognition Experiment")
 
-# Bilanciamento classi: calcoliamo il peso inverso della frequenza di ogni classe
-labels_array = train_dataset.processed["emotion"].map(train_dataset.label_map).values
-class_counts = np.bincount(labels_array)
-class_weights = [
-    len(labels_array) / (len(class_counts) * c) for c in class_counts
-]  # Calcola il peso inverso della frequenza
-class_weights = torch.tensor(class_weights, dtype=torch.float32).to(
-    device
-)  # Sposta i pesi sul device
+    # --- Sezione 3: Caricamento Dati e Creazione del Modello ---
+    # Data paths
+    BASE_DIR = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
+    )
+    TRAIN_LANDMARKS_DIR = os.path.join(
+        BASE_DIR, "data", "raw", "train", "openpose_output_train", "json"
+    )
+    TRAIN_PROCESSED_FILE = os.path.join(
+        BASE_DIR, "data", "processed", "train", "video_sentiment_data_0.65.csv"
+    )
+    VAL_LANDMARKS_DIR = os.path.join(
+        BASE_DIR, "data", "raw", "val", "openpose_output_val", "json"
+    )
+    VAL_PROCESSED_FILE = os.path.join(
+        BASE_DIR, "data", "processed", "val", "video_sentiment_data_0.65.csv"
+    )
 
-# 3. Determino dimensione input e creo il modello in base a MODEL_TYPE
-input_size = train_dataset[0][0].shape[1]  # numero di feature per frame
-num_classes = len(train_dataset.labels)
-if MODEL_TYPE == "lstm":
-    model = EmotionLSTM(
-        input_size, HIDDEN_SIZE, NUM_LAYERS, num_classes, dropout=DROP_OUT
-    ).to(device)
-elif MODEL_TYPE == "stgcn":
-    # ricava numero di punti e crea ST-GCN
-    coords_per_point = 2  # x,y per landmark
-    num_point = input_size // coords_per_point  # number of landmark nodes
-    model = STGCN(
-        num_classes, num_point, num_person=1, in_channels=coords_per_point
-    ).to(device)
+    train_dataset = LandmarkDataset(
+        landmarks_dir=TRAIN_LANDMARKS_DIR, processed_file=TRAIN_PROCESSED_FILE
+    )
+    val_dataset = LandmarkDataset(
+        landmarks_dir=VAL_LANDMARKS_DIR, processed_file=VAL_PROCESSED_FILE
+    )
 
-# 4. Definiamo la loss function con pesi di classe per penalizzare le classi minoritarie.
-# NOTE: Significa che gli errori sulle classi minoritarie avranno un peso maggiore nella loss.
-criterion = nn.CrossEntropyLoss(
-    weight=class_weights
-)  # Penalizza di più la classe minoritaria
-optimizer = torch.optim.Adam(
-    model.parameters(), lr=LEARNING_RATE
-)  # Algoritmo che aggiorna i pesi del modello per minimizzare la loss.
-# Scheduler: reduce LR on plateau of val_f1
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
-scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=3)
+    # Bilanciamento classi
+    labels_array = (
+        train_dataset.processed["emotion"].map(train_dataset.label_map).values
+    )
+    class_counts = np.bincount(labels_array)
+    class_weights = [len(labels_array) / (len(class_counts) * c) for c in class_counts]
+    class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
 
-# Setup Ignite trainer and evaluator on the same device; accumulate metrics on CPU to avoid float64 MPS errors
-trainer = create_supervised_trainer(model, optimizer, criterion, device=device)
-# Gradient clipping
-trainer.add_event_handler(
-    Events.ITERATION_STARTED,
-    lambda engine: torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0),
-)
+    # Determino dimensione input e creo il modello
+    input_size = train_dataset[0][0].shape[1]
+    num_classes = len(train_dataset.labels)
+    if args.model_type == "lstm":
+        model = EmotionLSTM(
+            input_size,
+            args.hidden_size,
+            args.num_layers,
+            num_classes,
+            dropout=args.dropout,
+        ).to(device)
+    elif args.model_type == "stgcn":
+        coords_per_point = 2
+        num_point = input_size // coords_per_point
+        model = STGCN(
+            num_classes, num_point, num_person=1, in_channels=coords_per_point
+        ).to(device)
 
-evaluator = create_supervised_evaluator(
-    model,
-    metrics={
-        "val_loss": Loss(criterion, device="cpu"),
-        "val_acc": Accuracy(device="cpu"),
-    },
-    device=device,
-)
-# Checkpoint handler: save best model by val_loss (allow non-empty directory)
-checkpoint_handler = ModelCheckpoint(
-    dirname=os.path.join(BASE_DIR, "models"),
-    filename_prefix=f"emotion_{MODEL_TYPE}",
-    n_saved=1,
-    create_dir=True,
-    require_empty=False,
-    score_function=lambda eng: -eng.state.metrics["val_loss"],
-    score_name="val_loss",
-)
-evaluator.add_event_handler(Events.COMPLETED, checkpoint_handler, {"model": model})
-# EarlyStopping handler
-earlystop_handler = IgniteEarlyStopping(
-    patience=PATIENCE,
-    score_function=lambda eng: -eng.state.metrics["val_loss"],
-    trainer=trainer,
-)
-evaluator.add_event_handler(Events.COMPLETED, earlystop_handler)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=3)
 
-# --- Sezione 4: Ciclo di Addestramento (Training Loop) ---
-print("Inizio training con validazione (Ignite)...")
+    trainer = create_supervised_trainer(model, optimizer, criterion, device=device)
+    evaluator = create_supervised_evaluator(
+        model,
+        metrics={
+            "val_loss": Loss(criterion, device="cpu"),
+            "val_acc": Accuracy(device="cpu"),
+        },
+        device=device,
+    )
 
-run_name = f"EmotionRecognition_{MODEL_TYPE}_train"
+    # Handlers
+    checkpoint_handler = ModelCheckpoint(
+        dirname=os.path.join(BASE_DIR, "models"),
+        filename_prefix=f"emotion_{args.model_type}",
+        n_saved=1,
+        create_dir=True,
+        require_empty=False,
+        score_function=lambda eng: -eng.state.metrics["val_loss"],
+        score_name="val_loss",
+    )
+    evaluator.add_event_handler(Events.COMPLETED, checkpoint_handler, {"model": model})
 
-with mlflow.start_run(run_name=run_name) as run:
-    # Log hyperparameters
-    mlflow.log_params(params)
-    # Initialize best metrics for logging after training
-    best_metrics = {"val_loss": float("inf"), "val_f1": 0.0, "val_f1_macro": 0.0}
+    earlystop_handler = IgniteEarlyStopping(
+        patience=args.patience,
+        score_function=lambda eng: -eng.state.metrics["val_loss"],
+        trainer=trainer,
+    )
+    evaluator.add_event_handler(Events.COMPLETED, earlystop_handler)
 
-    # On each epoch end: run evaluation and log metrics
-    @trainer.on(Events.EPOCH_COMPLETED)
-    def validate_and_log(engine):
-        # Compute average training loss on train_loader
-        model.eval()
-        train_loss_sum = 0.0
-        with torch.no_grad():
-            for xb, yb in train_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                outputs = model(xb.float())
-                loss = criterion(outputs, yb)
-                train_loss_sum += loss.item() * xb.size(0)
-        train_loss = train_loss_sum / len(train_loader.dataset)
+    # --- Sezione 4: Ciclo di Addestramento ---
+    print("Inizio training con validazione (Ignite)...")
+    run_name = f"EmotionRecognition_{args.model_type}_train"
 
-        evaluator.run(val_loader)
-        metrics = evaluator.state.metrics
-        val_loss = metrics["val_loss"]
-        val_acc = metrics["val_acc"]
-        # Compute F1 manually on CPU to avoid MPS float64 errors
-        y_true, y_pred = [], []
-        model.eval()
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                xb = xb.to(device)
-                yb = yb.to(device)
-                outputs = model(xb.float())
-                preds = torch.argmax(outputs, dim=1)
-                y_true.extend(yb.cpu().numpy())
-                y_pred.extend(preds.cpu().numpy())
-        val_f1 = f1_score(y_true, y_pred, average="weighted")
-        # Compute macro F1
-        val_f1_macro = f1_score(y_true, y_pred, average="macro")
+    with mlflow.start_run(run_name=run_name) as run:
+        params = {
+            "model_type": args.model_type,
+            "hidden_size": args.hidden_size,
+            "num_layers": args.num_layers,
+            "batch_size": args.batch_size,
+            "num_epochs": args.num_epochs,
+            "learning_rate": args.learning_rate,
+            "patience": args.patience,
+            "dropout": args.dropout,
+            "seed": args.seed,
+        }
+        mlflow.log_params(params)
+        best_metrics = {"val_loss": float("inf"), "val_f1": 0.0, "val_f1_macro": 0.0}
 
-        # Update best metrics
-        if val_loss < best_metrics["val_loss"]:
-            best_metrics["val_loss"] = val_loss
-        if val_f1 > best_metrics["val_f1"]:
-            best_metrics["val_f1"] = val_f1
-        if val_f1_macro > best_metrics["val_f1_macro"]:
-            best_metrics["val_f1_macro"] = val_f1_macro
+        @trainer.on(Events.EPOCH_COMPLETED)
+        def validate_and_log(engine):
+            # Compute average training loss on train_loader
+            model.eval()
+            train_loss_sum = 0.0
+            with torch.no_grad():
+                for xb, yb in train_loader:
+                    xb, yb = xb.to(device), yb.to(device)
+                    outputs = model(xb.float())
+                    loss = criterion(outputs, yb)
+                    train_loss_sum += loss.item() * xb.size(0)
+            train_loss = train_loss_sum / len(train_loader.dataset)
 
-        mlflow.log_metrics(
-            {
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "val_acc": val_acc,
-                "val_f1": val_f1,
-                "val_f1_macro": val_f1_macro,
-            },
-            step=engine.state.epoch,
-        )
+            evaluator.run(val_loader)
+            metrics = evaluator.state.metrics
+            val_loss = metrics["val_loss"]
+            val_acc = metrics["val_acc"]
+            # Compute F1 manually on CPU to avoid MPS float64 errors
+            y_true, y_pred = [], []
+            model.eval()
+            with torch.no_grad():
+                for xb, yb in val_loader:
+                    xb = xb.to(device)
+                    outputs = model(xb.float())  # No need for yb on device here
+                    preds = torch.argmax(outputs, dim=1)
+                    y_true.extend(yb.cpu().numpy())
+                    y_pred.extend(preds.cpu().numpy())
+            val_f1 = f1_score(y_true, y_pred, average="weighted")
+            # Compute macro F1
+            val_f1_macro = f1_score(y_true, y_pred, average="macro")
+
+            # Update best metrics
+            if val_loss < best_metrics["val_loss"]:
+                best_metrics["val_loss"] = val_loss
+            if val_f1 > best_metrics["val_f1"]:
+                best_metrics["val_f1"] = val_f1
+            if val_f1_macro > best_metrics["val_f1_macro"]:
+                best_metrics["val_f1_macro"] = val_f1_macro
+
+            mlflow.log_metrics(
+                {
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                    "val_f1": val_f1,
+                    "val_f1_macro": val_f1_macro,
+                },
+                step=engine.state.epoch,
+            )
+            print(
+                f"Epoch {engine.state.epoch}/{args.num_epochs}, "
+                f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
+                f"Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f}"
+            )
+            scheduler.step(val_loss)
+
+            # Clear cache
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            elif device.type == "mps":
+                torch.mps.empty_cache()
+
+        trainer.run(train_loader, max_epochs=args.num_epochs)
+
         print(
-            f"Epoch {engine.state.epoch}/{NUM_EPOCHS}, "
-            f"Train Loss: {train_loss:.4f}, "
-            f"Val Loss: {val_loss:.4f}, "
-            f"Val Acc: {val_acc:.4f}, "
-            f"Val F1: {val_f1:.4f}"
+            f"Training completato. Best model saved in {checkpoint_handler.last_checkpoint}"
         )
-        # Step scheduler on validation loss
-        scheduler.step(val_loss)
 
-    # Run training with Ignite
-    trainer.run(train_loader, max_epochs=NUM_EPOCHS)
+        # After training: log final metrics (best)
+        mlflow.log_metric("best_val_loss", best_metrics["val_loss"])
+        mlflow.log_metric("best_val_f1", best_metrics["val_f1"])
+        mlflow.log_metric("best_val_f1_macro", best_metrics["val_f1_macro"])
 
-    print(f"Training completato. Best model saved in {checkpoint_handler._saved[-1]}")
+        # Infer model signature and log the model
+        signature = infer_signature(
+            train_dataset[0][0].numpy(),
+            model(train_dataset[0][0].unsqueeze(0).to(device).float())
+            .cpu()
+            .detach()
+            .numpy(),
+        )
+        mlflow.pytorch.log_model(
+            pytorch_model=model,
+            artifact_path="model",
+            signature=signature,
+            registered_model_name="EmoSign_pytorch",
+        )
+        mlflow.set_tag("experiment_purpose", "PyTorch emotion recognition")
 
-    # After training: log final metrics (best)
-    mlflow.log_metric("best_val_loss", best_metrics["val_loss"])
-    mlflow.log_metric("best_val_f1", best_metrics["val_f1"])
-    mlflow.log_metric("best_val_f1_macro", best_metrics["val_f1_macro"])
-
-    # Infer model signature and log the model
-    signature = infer_signature(
-        train_dataset[0][0].numpy(),
-        model(train_dataset[0][0].unsqueeze(0).to(device).float())
-        .cpu()
-        .detach()
-        .numpy(),
-    )
-    model_info = mlflow.pytorch.log_model(
-        pytorch_model=model,
-        artifact_path="model",
-        signature=signature,
-        registered_model_name="EmoSign_pytorch",
-    )
-
-    # Tag the run for reference
-    mlflow.set_tag("experiment_purpose", "PyTorch emotion recognition")
-    mlflow.set_tag("run_id", run.info.run_id)
 
 # parsing iperparametri da linea di comando
-parser = argparse.ArgumentParser(description="Train EmotionLSTM with hyperparameters")
-parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
-parser.add_argument("--hidden_size", type=int, default=HIDDEN_SIZE)
-parser.add_argument("--num_layers", type=int, default=NUM_LAYERS)
-parser.add_argument("--learning_rate", type=float, default=LEARNING_RATE)
-parser.add_argument("--num_epochs", type=int, default=NUM_EPOCHS)
-parser.add_argument("--dropout", type=float, default=0.5)
-parser.add_argument("--patience", type=int, default=PATIENCE)
-args = parser.parse_args()
-
-# Override hyperparameters from CLI
-BATCH_SIZE = args.batch_size
-HIDDEN_SIZE = args.hidden_size
-NUM_LAYERS = args.num_layers
-LEARNING_RATE = args.learning_rate
-NUM_EPOCHS = args.num_epochs
-PATIENCE = args.patience
-DROPOUT = args.dropout
-params.update({"dropout": DROPOUT, "patience": PATIENCE})
-
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train Emotion Recognition Model")
+    parser.add_argument(
+        "--model_type", type=str, default="lstm", choices=["lstm", "stgcn"]
+    )
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--hidden_size", type=int, default=256)
+    parser.add_argument("--num_layers", type=int, default=2)
+    parser.add_argument("--learning_rate", type=float, default=1e-3)
+    parser.add_argument("--num_epochs", type=int, default=50)
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed for reproducibility"
+    )
+    args = parser.parse_args()
+    main(args)
 
 # python train_model.py --batch_size 64 --hidden_size 512 --num_layers 3 --learning_rate 0.0005 --dropout 0.3
