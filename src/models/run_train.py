@@ -1,14 +1,24 @@
 # mlflow server --host 127.0.0.1 --port 8080
 
 
-# python3 src/models/run_train.py \
-#   --model_type lstm \
+# python src/models/run_train.py \
 #   --batch_size 128 \
 #   --hidden_size 896 \
 #   --num_layers 5 \
 #   --learning_rate 1.0677482709481361e-05 \
 #   --dropout 0.23993475643167195 \
-#   --num_epochs 100
+#   --num_epochs 100 \
+#   --seed 44
+
+# BEST
+# python src/models/run_train.py \
+#   --batch_size 128 \
+#   --hidden_size 896 \
+#   --num_layers 3 \
+#   --learning_rate 2.621087878265438e-05 \
+#   --dropout 0.23993475643167195 \
+#   --num_epochs 100 \
+#   --seed 44
 
 
 import torch
