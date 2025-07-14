@@ -65,7 +65,7 @@ VAL_PROCESSED_FILE = os.path.join(
 # Globals for closure
 NUM_EPOCHS = 5
 MODEL_TYPE = "lstm"
-PATIENCE = 5  # early stopping patience
+PATIENCE = 10  # early stopping patience
 
 
 def prepare_batch(batch, device, non_blocking=False):
@@ -102,7 +102,9 @@ def objective(trial):
         # Search space for ST-GCN
         learning_rate = trial.suggest_loguniform("learning_rate", 1e-5, 1e-2)
         batch_size = trial.suggest_categorical("batch_size", [16, 32, 64, 128])
-        dropout = trial.suggest_float("dropout", 0.1, 0.7)
+        dropout = trial.suggest_float(
+            "dropout", 0, 0.2
+        )  # NOTE: fare un test anche senza dropout
         params_to_log = {"stgcn_dropout": dropout}
 
     # Load data
@@ -133,11 +135,17 @@ def objective(trial):
     # The validation loader remains unchanged to evaluate on the real, imbalanced data distribution.
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    # Class weights for the loss function (acts as a secondary balancing mechanism)
+    # --- Class weights for the loss function ---
+    # Calculate weights to counteract class imbalance in the loss function.
+    # This gives more penalty to errors on the minority class.
     labels_arr = train_dataset.processed["emotion"].map(train_dataset.label_map).values
-    counts = np.bincount(labels_arr)
-    weights = [len(labels_arr) / (len(counts) * c) for c in counts]
-    class_weights = torch.tensor(weights, dtype=torch.float32)
+    class_counts = np.bincount(labels_arr)
+    num_classes = len(class_counts)
+    total_samples = len(labels_arr)
+    class_weights = torch.tensor(
+        [total_samples / (num_classes * count) for count in class_counts],
+        dtype=torch.float32,
+    )
 
     # Device selection
     if torch.backends.mps.is_available():

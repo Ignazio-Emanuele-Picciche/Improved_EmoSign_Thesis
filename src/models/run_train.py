@@ -168,7 +168,11 @@ def main(args):
         coords_per_point = 2
         num_point = input_size // coords_per_point
         model = STGCN(
-            num_classes, num_point, num_person=1, in_channels=coords_per_point
+            num_classes,
+            num_point,
+            num_person=1,
+            in_channels=coords_per_point,
+            dropout_rate=args.dropout,
         ).to(device)
 
     criterion = nn.CrossEntropyLoss(weight=class_weights)
