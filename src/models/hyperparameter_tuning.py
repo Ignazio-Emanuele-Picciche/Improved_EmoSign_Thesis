@@ -1,6 +1,29 @@
-# python3 src/models/hyperparameter_tuning.py --model_type lstm --n_trials 15 --num_epochs 20
-# python3 src/models/hyperparameter_tuning.py --model_type lstm --n_trials 40 --num_epochs 40
-# mlflow server --host 127.0.0.1 --port 8080
+# =================================================================================================
+# COMANDI UTILI PER L'ESECUZIONE
+# =================================================================================================
+#
+# 1. AVVIARE IL SERVER MLFLOW
+#    Per monitorare gli esperimenti, prima di eseguire lo script di tuning,
+#    aprire un terminale e lanciare il server MLflow:
+#
+#    mlflow server --host 127.0.0.1 --port 8080
+#
+# 2. ESEGUIRE L'OTTIMIZZAZIONE DEGLI IPERPARAMETRI
+#    Questo script utilizza Optuna per trovare i migliori iperparametri per un dato modello.
+#    È possibile specificare il tipo di modello (lstm o stgcn), il numero di "trial" (tentativi)
+#    e il numero di epoche per ogni trial.
+#
+#    ESEMPIO DI COMANDO PER LSTM:
+#    Esegue 40 tentativi di ottimizzazione per il modello LSTM, addestrando per 40 epoche ogni volta.
+#
+#    python3 src/models/hyperparameter_tuning.py --model_type lstm --n_trials 40 --num_epochs 40
+#
+#    ESEMPIO DI COMANDO PER ST-GCN:
+#    Esegue 20 tentativi di ottimizzazione per il modello ST-GCN, addestrando per 25 epoche ogni volta.
+#
+#    python3 src/models/hyperparameter_tuning.py --model_type stgcn --n_trials 20 --num_epochs 25
+#
+# =================================================================================================
 
 import os
 import sys
@@ -30,7 +53,8 @@ from optuna.integration import PyTorchIgnitePruningHandler
 from optuna.exceptions import TrialPruned
 
 
-# Add project src to PATH
+# --- Sezione 1: Setup del Percorso di Base ---
+# Aggiunge la directory radice del progetto (src) al path di Python per importare moduli custom.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
 BASE_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
@@ -40,7 +64,9 @@ from data_pipeline.landmark_dataset import LandmarkDataset
 from models.lstm_model import EmotionLSTM
 from models.stgcn_model import STGCN
 
-# MLflow tracking setup
+# --- Sezione 2: Setup di MLflow ---
+# Imposta l'URI del server MLflow e il nome dell'esperimento.
+# Se l'esperimento non esiste, viene creato.
 mlflow.set_tracking_uri("http://127.0.0.1:8080")
 experiment_name = "Emotion Recognition Experiment"
 if mlflow.get_experiment_by_name(experiment_name) is None:
@@ -48,7 +74,8 @@ if mlflow.get_experiment_by_name(experiment_name) is None:
 else:
     mlflow.set_experiment(experiment_name)
 
-# Data paths
+# --- Sezione 3: Definizione dei Percorsi Dati ---
+# Definisce i percorsi per i dati di training e validazione.
 TRAIN_LANDMARKS_DIR = os.path.join(
     BASE_DIR, "data", "raw", "train", "openpose_output_train", "json"
 )
@@ -62,18 +89,22 @@ VAL_PROCESSED_FILE = os.path.join(
     BASE_DIR, "data", "processed", "val", "video_sentiment_data_0.65.csv"
 )
 
-# Globals for closure
+# --- Sezione 4: Variabili Globali ---
+# Variabili globali che verranno impostate dalla linea di comando.
 NUM_EPOCHS = 5
 MODEL_TYPE = "lstm"
-PATIENCE = 10  # early stopping patience
+PATIENCE = 10  # Pazienza per l'early stopping
 
 
 def prepare_batch(batch, device, non_blocking=False):
-    """Prepare batch for training: move to device and reshape for ST-GCN."""
+    """
+    Prepara un batch di dati per l'addestramento.
+    Sposta i tensori sul dispositivo corretto e rimodella l'input per ST-GCN.
+    """
     x, y = batch
     if MODEL_TYPE == "stgcn":
-        # Reshape input from (B, T, F) to (B, T, N, C)
-        # B=batch, T=time, F=features, N=num_points, C=channels
+        # Rimodella l'input da (B, T, F) a (B, T, N, C)
+        # B=batch, T=time, F=features, N=numero di punti, C=canali (coordinate)
         b, t, f = x.shape
         coords_per_point = 2
         num_point = f // coords_per_point
@@ -85,9 +116,16 @@ def prepare_batch(batch, device, non_blocking=False):
 
 
 def objective(trial):
-    # --- Hyperparameter suggestion based on model type ---
+    """
+    Funzione "obiettivo" di Optuna.
+    Questa funzione definisce, esegue e valuta un singolo "trial" (tentativo) di
+    ottimizzazione degli iperparametri.
+    """
+    # --- Sezione 5: Definizione dello Spazio di Ricerca degli Iperparametri ---
+    # Optuna suggerisce i valori per gli iperparametri da uno spazio di ricerca definito.
+    # Lo spazio di ricerca è diverso a seconda del tipo di modello.
     if MODEL_TYPE == "lstm":
-        # Search space for LSTM
+        # Spazio di ricerca per LSTM
         hidden_size = trial.suggest_int("hidden_size", 768, 1024, step=32)
         num_layers = trial.suggest_int("num_layers", 2, 5)
         dropout = trial.suggest_float("dropout", 0.2, 0.5)
@@ -99,15 +137,15 @@ def objective(trial):
             "dropout": dropout,
         }
     else:  # stgcn
-        # Search space for ST-GCN
+        # Spazio di ricerca per ST-GCN
         learning_rate = trial.suggest_loguniform("learning_rate", 1e-5, 1e-2)
         batch_size = trial.suggest_categorical("batch_size", [16, 32, 64, 128])
         dropout = trial.suggest_float(
             "dropout", 0, 0.2
-        )  # NOTE: fare un test anche senza dropout
+        )  # NOTA: testare anche senza dropout
         params_to_log = {"stgcn_dropout": dropout}
 
-    # Load data
+    # --- Sezione 6: Caricamento Dati e Gestione Sbilanciamento ---
     train_dataset = LandmarkDataset(
         landmarks_dir=TRAIN_LANDMARKS_DIR, processed_file=TRAIN_PROCESSED_FILE
     )
@@ -115,9 +153,8 @@ def objective(trial):
         landmarks_dir=VAL_LANDMARKS_DIR, processed_file=VAL_PROCESSED_FILE
     )
 
-    # --- Weighted Sampler for Handling Class Imbalance ---
-    # Create a sampler to ensure each batch has a balanced representation of classes.
-    # This is a powerful technique to force the model to learn from the minority class.
+    # --- Weighted Sampler per gestire lo sbilanciamento delle classi ---
+    # Crea un sampler che bilancia le classi in ogni batch.
     labels_arr = train_dataset.processed["emotion"].map(train_dataset.label_map).values
     class_counts = np.bincount(labels_arr)
     class_weights_for_sampler = 1.0 / class_counts
@@ -130,14 +167,12 @@ def objective(trial):
         replacement=True,
     )
 
-    # When using a sampler, shuffle must be False. The sampler handles the random sampling.
+    # I DataLoader utilizzano il sampler per il training.
     train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
-    # The validation loader remains unchanged to evaluate on the real, imbalanced data distribution.
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    # --- Class weights for the loss function ---
-    # Calculate weights to counteract class imbalance in the loss function.
-    # This gives more penalty to errors on the minority class.
+    # --- Pesi per la Funzione di Loss ---
+    # Calcola i pesi per la loss function per penalizzare maggiormente gli errori sulle classi minoritarie.
     labels_arr = train_dataset.processed["emotion"].map(train_dataset.label_map).values
     class_counts = np.bincount(labels_arr)
     num_classes = len(class_counts)
@@ -147,7 +182,8 @@ def objective(trial):
         dtype=torch.float32,
     )
 
-    # Device selection
+    # --- Sezione 7: Setup del Modello e dell'Addestramento ---
+    # Seleziona il dispositivo (CPU, GPU, MPS).
     if torch.backends.mps.is_available():
         device = torch.device("mps")
     elif torch.cuda.is_available():
@@ -156,7 +192,7 @@ def objective(trial):
         device = torch.device("cpu")
     class_weights = class_weights.to(device)
 
-    # Model instantiation
+    # Istanzia il modello corretto (LSTM o ST-GCN) con gli iperparametri suggeriti da Optuna.
     input_size = train_dataset[0][0].shape[1]
     num_classes = len(train_dataset.labels)
     if MODEL_TYPE == "lstm":
@@ -174,14 +210,14 @@ def objective(trial):
             dropout_rate=dropout,
         ).to(device)
 
+    # Inizializza loss, ottimizzatore e scheduler.
     criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    # scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=3)  # NOTE Old: monitors val_loss
     scheduler = ReduceLROnPlateau(
         optimizer, mode="max", factor=0.1, patience=3
-    )  # NOTE New: monitors val_f1_macro
+    )  # Monitora val_f1_macro
 
-    # Use the custom prepare_batch function for trainers and evaluators
+    # Crea trainer e evaluator di Ignite.
     trainer = create_supervised_trainer(
         model, optimizer, criterion, device=device, prepare_batch=prepare_batch
     )
@@ -192,14 +228,14 @@ def objective(trial):
         prepare_batch=prepare_batch,
     )
 
-    # Funzione per calcolare e aggiungere F1 score alle metriche
+    # Funzione per calcolare e aggiungere gli F1 score alle metriche alla fine della validazione.
     @evaluator.on(Events.COMPLETED)
     def compute_f1_scores(engine):
         y_true, y_pred = [], []
         model.eval()
         with torch.no_grad():
             for xb, yb in val_loader:
-                # Reshaping is now handled by prepare_batch, so we pass the original batch
+                # Il reshaping è gestito da prepare_batch
                 xb, yb = prepare_batch((xb, yb), device)
                 outputs = model(xb.float())
                 preds = torch.argmax(outputs, dim=1)
@@ -215,9 +251,10 @@ def objective(trial):
             float(f1_per_class[1]) if len(f1_per_class) > 1 else 0.0
         )
 
-    # nested MLflow run per trial
+    # --- Sezione 8: Esecuzione del Trial e Logging ---
+    # Avvia una run nidificata in MLflow per questo specifico trial.
     with mlflow.start_run(nested=True):
-        # Log common and model-specific parameters
+        # Logga i parametri comuni e quelli specifici del modello.
         base_params = {
             "learning_rate": learning_rate,
             "batch_size": batch_size,
@@ -225,27 +262,28 @@ def objective(trial):
         }
         mlflow.log_params({**base_params, **params_to_log})
 
-        # Log mapping from class indices to emotion labels
+        # Logga la mappatura delle classi (es. 0: 'neutral', 1: 'emotion').
         class_map = {i: label for i, label in enumerate(train_dataset.labels)}
         mlflow.log_params({f"class_{i}": label for i, label in class_map.items()})
 
         best_metrics = {"val_loss": float("inf"), "val_f1": 0.0, "val_f1_macro": 0.0}
 
+        # Funzione eseguita alla fine di ogni epoca di addestramento.
         @trainer.on(Events.EPOCH_COMPLETED)
         def log_validation_results(engine):
-            # Compute average training loss for this epoch
+            # Calcola la loss media sul training set.
             model.eval()
             train_loss_sum = 0.0
             with torch.no_grad():
                 for xb, yb in train_loader:
-                    # Reshaping is now handled by prepare_batch
+                    # Il reshaping è gestito da prepare_batch
                     xb, yb = prepare_batch((xb, yb), device)
                     outputs = model(xb.float())
                     loss = criterion(outputs, yb)
                     train_loss_sum += loss.item() * xb.size(0)
             train_loss = train_loss_sum / len(train_loader.dataset)
 
-            # Esegui evaluator per calcolare tutte le metriche (loss, acc, e F1)
+            # Esegue la validazione e ottiene le metriche.
             evaluator.run(val_loader)
             metrics = evaluator.state.metrics
             val_loss = metrics["val_loss"]
@@ -253,7 +291,7 @@ def objective(trial):
             val_f1 = metrics["val_f1"]
             val_f1_macro = metrics["val_f1_macro"]
 
-            # Update best macro F1
+            # Aggiorna le migliori metriche del trial.
             if val_f1_macro > best_metrics["val_f1_macro"]:
                 best_metrics["val_f1_macro"] = val_f1_macro
 
@@ -262,6 +300,7 @@ def objective(trial):
             if val_f1 > best_metrics["val_f1"]:
                 best_metrics["val_f1"] = val_f1
 
+            # Logga le metriche dell'epoca su MLflow.
             mlflow.log_metrics(
                 {
                     "train_loss": train_loss,
@@ -274,21 +313,23 @@ def objective(trial):
                 },
                 step=engine.state.epoch,
             )
-            # scheduler.step(val_loss)  # NOTE Old: monitors val_loss
+            # Aggiorna lo scheduler e svuota la cache.
             scheduler.step(
                 val_f1_macro
-            )  # NOTE New: monitors val_f1_macro to better handle imbalance
+            )  # Monitora val_f1_macro per gestire lo sbilanciamento
             # Clear GPU/MPS cache to prevent OOM
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             elif device.type == "mps":
                 torch.mps.empty_cache()
 
-        # Optuna pruner: ora monitora val_f1_macro
+        # --- Sezione 9: Pruning e Early Stopping ---
+        # Pruning: meccanismo di Optuna per interrompere i trial poco promettenti.
+        # Monitora 'val_f1_macro' e ferma il trial se le performance sono scarse.
         pruning_handler = PyTorchIgnitePruningHandler(trial, "val_f1_macro", trainer)
         evaluator.add_event_handler(Events.COMPLETED, pruning_handler)
 
-        # Early stopping: ora monitora val_f1_macro
+        # Early Stopping: ferma l'addestramento se 'val_f1_macro' non migliora per 'PATIENCE' epoche.
         early_stopper = IgniteEarlyStopping(
             patience=PATIENCE,
             score_function=lambda eng: eng.state.metrics["val_f1_macro"],
@@ -297,33 +338,35 @@ def objective(trial):
         evaluator.add_event_handler(Events.COMPLETED, early_stopper)
 
         try:
+            # Avvia l'addestramento.
             trainer.run(train_loader, max_epochs=NUM_EPOCHS)
         except TrialPruned:
+            # Se il trial viene "potato" (pruned), lo segnala in MLflow e solleva l'eccezione.
             mlflow.set_tag("status", "pruned")
             raise
 
-        # Log delle metriche finali di fine trial
+        # Logga le migliori metriche ottenute alla fine del trial.
         mlflow.log_metrics(
             {
                 "best_val_loss": best_metrics["val_loss"],
                 "best_val_f1": best_metrics["val_f1"],
                 "best_val_f1_macro": best_metrics["val_f1_macro"],
-                # "best_val_f1_class_0": float(f1_per_class[0]),
-                # "best_val_f1_class_1": (
-                #     float(f1_per_class[1]) if len(f1_per_class) > 1 else None
-                # ),
             }
         )
-        # Clear cache after trial
+        # Svuota la cache alla fine del trial.
         if device.type == "cuda":
             torch.cuda.empty_cache()
         elif device.type == "mps":
             torch.mps.empty_cache()
-        # Restituisce la metrica da ottimizzare (massimizzare)
+        # Restituisce la metrica che Optuna deve ottimizzare (massimizzare).
         return best_metrics["val_f1_macro"]
 
 
 def main():
+    """
+    Funzione principale che orchestra l'intero processo di ottimizzazione.
+    """
+    # --- Sezione 10: Parsing degli Argomenti e Setup dello Studio ---
     parser = argparse.ArgumentParser(
         description="Hyperparameter tuning with Optuna and MLflow"
     )
@@ -338,7 +381,7 @@ def main():
         "--seed", type=int, default=42, help="Random seed for reproducibility"
     )
     args = parser.parse_args()
-    # Set random seeds for reproducibility
+    # Imposta i seed per la riproducibilità.
     seed = args.seed
     random.seed(seed)
     np.random.seed(seed)
@@ -349,21 +392,25 @@ def main():
     cudnn.benchmark = False
     torch.use_deterministic_algorithms(True)
 
+    # Imposta le variabili globali con i valori passati da linea di comando.
     global NUM_EPOCHS, MODEL_TYPE
     NUM_EPOCHS = args.num_epochs
     MODEL_TYPE = args.model_type
-    # Parent MLflow run per studio di ottimizzazione
+    # Avvia una run "genitore" in MLflow per l'intero studio di ottimizzazione.
     run_name = f"Optuna_{MODEL_TYPE}_tuning"
     with mlflow.start_run(run_name=run_name):
-        # Log seed used for reproducibility
+        # Logga il seed per la riproducibilità.
         mlflow.log_param("seed", seed)
+        # Crea lo "studio" di Optuna, specificando la direzione (massimizzare f1_macro),
+        # il pruner e il sampler.
         study = optuna.create_study(
-            direction="maximize",  # Cambiato a "maximize" per f1_macro
+            direction="maximize",  # Massimizza f1_macro
             pruner=MedianPruner(n_startup_trials=PATIENCE, n_warmup_steps=1),
             sampler=TPESampler(seed=seed),
         )
+        # Avvia l'ottimizzazione.
         study.optimize(objective, n_trials=args.n_trials)
-        # Log global tuning info
+        # Alla fine dello studio, logga le informazioni globali su MLflow.
         mlflow.log_param("n_trials", args.n_trials)
         mlflow.log_params(study.best_trial.params)
         mlflow.log_metric("best_val_f1_macro_study", study.best_value)
