@@ -134,7 +134,9 @@ def objective(trial):
 
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.1, patience=3)
+    scheduler = ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.1, patience=3
+    )  # NOTE: scheduler learning rate adjustment
 
     prepare_batch_fn = lambda batch, device, non_blocking: prepare_batch(
         batch, device, MODEL_TYPE, non_blocking
@@ -195,7 +197,7 @@ def objective(trial):
                 },
                 step=engine.state.epoch,
             )
-            scheduler.step(val_f1_macro)
+            scheduler.step(val_f1_macro)  # NOTE: scheduler learning rate adjustment
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             elif device.type == "mps":
