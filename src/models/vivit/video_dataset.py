@@ -1,3 +1,7 @@
+# video_dataset.py: definisce la classe VideoDataset per il caricamento, campionamento e pre-processing dei video
+# Legge un file CSV di annotazioni, campiona uniformemente fotogrammi e usa l'image_processor di Hugging Face
+# per preparare i tensori (pixel_values) e restituisce etichette numeriche per il training.
+
 import os
 import pandas as pd
 import torch
@@ -74,10 +78,6 @@ class VideoDataset(Dataset):
             ).pixel_values  # shape: (1, num_frames, C, H, W)
             # Rimuovi la dimensione batch extra restituita dall'image_processor
             pixel_values = pixel_values.squeeze(0)  # shape: (num_frames, C, H, W)
-            # Trasponi per ottenere (C, num_frames, H, W)
-            pixel_values = pixel_values.permute(
-                1, 0, 2, 3
-            )  # shape: (C, num_frames, H, W)
 
             logger.info(
                 f"Shape of pixel_values after processing: {pixel_values.shape}"

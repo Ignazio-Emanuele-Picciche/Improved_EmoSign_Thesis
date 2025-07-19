@@ -1,3 +1,7 @@
+# run_train_vivit.py: script principale per l'addestramento di un modello ViViT
+# per la classificazione delle emozioni.
+# Gestisce setup di MLflow, caricamento dataset, istanziazione del modello,
+# loop di training con Ignite, checkpoint ed EarlyStopping.
 # =================================================================================================
 # COMANDI UTILI PER L'ESECUZIONE
 # =================================================================================================
@@ -95,16 +99,7 @@ def get_sampler(dataset):
 
 def prepare_batch(batch, device=None, non_blocking=False):
     """Sposta il batch di dati sul dispositivo corretto."""
-    logger.info(f"Batch before device transfer: {batch}")  # Log del batch originale
-    logger.info(
-        f"Pixel values shape before transfer: {batch['pixel_values'].shape}"
-    )  # Log della forma originale
-    logger.info(
-        f"Labels shape before transfer: {batch['labels'].shape}"
-    )  # Log della forma delle etichette
     pixel_values = batch["pixel_values"].to(device, non_blocking=non_blocking)
-    # Riordina le dimensioni da (batch, T, C, H, W) a (batch, C, T, H, W) per ViViT
-    pixel_values = pixel_values.permute(0, 2, 1, 3, 4)
     labels = batch["labels"].to(device, non_blocking=non_blocking)
     return pixel_values, labels
 
@@ -117,7 +112,11 @@ def main(args):
         mlflow.create_experiment(experiment_name)
     mlflow.set_experiment(experiment_name)
 
-    with mlflow.start_run(run_name=f"vivit_train_{args.num_epochs}epochs"):
+    # Estrai un nome breve del modello per il run_name
+    model_short_name = args.model_name.split("/")[-1]
+    run_name = f"{model_short_name}_train_{args.num_epochs}epochs"
+
+    with mlflow.start_run(run_name=run_name):
         mlflow.log_params(vars(args))
 
         # --- Setup del Modello e Device ---
@@ -131,7 +130,7 @@ def main(args):
         # --- Caricamento Dati ---
         # Creiamo un'istanza preliminare del dataset solo per ottenere l'image_processor e num_classes
         _, temp_image_processor = create_vivit_model(
-            num_classes=2
+            num_classes=2, model_name=args.model_name
         )  # num_classes temporaneo
         train_dataset = VideoDataset(
             TRAIN_ANNOTATIONS_FILE, TRAIN_VIDEO_DIR, temp_image_processor
@@ -145,15 +144,28 @@ def main(args):
         logger.info(f"Numero di classi rilevato: {num_classes}")
 
         # Creiamo il modello con il numero corretto di classi
-        model, image_processor = create_vivit_model(num_classes)
-        model.to(device)
-
-        # I dataset devono essere ricreati con l'image_processor finale, sebbene in questo
-        # caso specifico l'istanza non cambi. È una buona pratica per coerenza.
-        train_dataset = VideoDataset(
-            TRAIN_ANNOTATIONS_FILE, TRAIN_VIDEO_DIR, image_processor
+        model, image_processor = create_vivit_model(
+            num_classes, model_name=args.model_name
         )
-        val_dataset = VideoDataset(VAL_ANNOTATIONS_FILE, VAL_VIDEO_DIR, image_processor)
+        model.to(device)
+        # Calcolo e log dei parametri del modello
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"Total parameters: {total_params:,}")
+        logger.info(f"Trainable parameters: {trainable_params:,}")
+
+        # Usa il numero di frame del modello per campionare correttamente
+        num_frames = model.config.num_frames  # es. 32
+        # Ricrea i dataset con l'image_processor finale e il numero corretto di frame
+        train_dataset = VideoDataset(
+            TRAIN_ANNOTATIONS_FILE,
+            TRAIN_VIDEO_DIR,
+            image_processor,
+            num_frames=num_frames,
+        )
+        val_dataset = VideoDataset(
+            VAL_ANNOTATIONS_FILE, VAL_VIDEO_DIR, image_processor, num_frames=num_frames
+        )
 
         train_sampler = get_sampler(train_dataset)
         train_loader = DataLoader(
@@ -204,6 +216,18 @@ def main(args):
                 raise
 
         trainer = Engine(train_step)
+
+        # Logging training progress
+        @trainer.on(Events.EPOCH_STARTED)
+        def log_epoch_start(engine):
+            logger.info(f"Starting Epoch {engine.state.epoch}.")
+
+        @trainer.on(Events.ITERATION_COMPLETED(every=10))
+        def log_iteration(engine):
+            loss = engine.state.output
+            logger.info(
+                f"Epoch[{engine.state.epoch}] Iteration[{engine.state.iteration}] Loss: {loss:.4f}"
+            )
 
         # Per l'evaluator, dobbiamo adattare l'output_transform
         def output_transform(output):
@@ -283,6 +307,12 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train ViViT for emotion recognition.")
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="google/vivit-b-16x2-kinetics400",
+        help="Name of the Hugging Face model to use.",
+    )
     parser.add_argument(
         "--num_epochs", type=int, default=10, help="Number of training epochs."
     )

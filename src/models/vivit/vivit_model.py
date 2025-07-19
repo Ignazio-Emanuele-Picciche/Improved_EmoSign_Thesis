@@ -1,3 +1,7 @@
+# vivit_model.py: definisce la funzione create_vivit_model per caricare e configurare
+# un modello ViViT pre-allenato da Hugging Face e il relativo image processor.
+# Congela il backbone e prepara la testa di classificazione per il fine-tuning.
+
 import torch
 import torch.nn as nn
 from transformers import VivitForVideoClassification, VivitImageProcessor
