@@ -16,6 +16,9 @@
 #    ESEMPIO DI COMANDO:
 #    python src/models/vivit/run_train_vivit.py --num_epochs 10 --batch_size 4 --learning_rate 5e-5
 #
+#  --model_name: Specifica il modello ViViT da utilizzare.
+#    Il default è "google/vivit-b-16x2-kinetics400",
+#    skywalker290/videomae-vivit-d1
 # =================================================================================================
 
 import os
@@ -49,6 +52,9 @@ from src.utils.training_utils import setup_ignite_evaluator  # Riutilizziamo l'e
 from ignite.engine import Engine, Events
 from ignite.handlers import ModelCheckpoint, EarlyStopping
 from ignite.metrics import Loss, Accuracy, Precision, Recall, Fbeta
+
+from ignite.contrib.handlers import ProgressBar
+
 
 # Configura il logging
 logging.basicConfig(level=logging.INFO)
