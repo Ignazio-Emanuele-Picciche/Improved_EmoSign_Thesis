@@ -46,7 +46,7 @@ class VideoDataset(Dataset):
         return indices
 
     def __getitem__(self, idx):
-        video_name = self.video_info.iloc[idx]["video_name"]
+        video_name = self.video_info.iloc[idx]["video_name"].strip()
         video_filename = f"{video_name}.mp4"  # Aggiunge l'estensione .mp4
         video_path_full = os.path.join(self.video_root_dir, video_filename)
 
@@ -55,7 +55,9 @@ class VideoDataset(Dataset):
 
         try:
             # Usa imageio per leggere il video
-            video = iio.imread(video_path_full, plugin="pyav")
+            # TODO: provare a scrippare sui prossimi video, onde evitare errori di lettura sul primo video
+            video = iio.imread(video_path_full)
+            # pyav plugin is not always available, so we use the default reader
             num_total_frames = video.shape[0]
 
             if num_total_frames == 0:
@@ -69,7 +71,17 @@ class VideoDataset(Dataset):
             # Pre-processa i fotogrammi usando l'image processor di ViViT
             pixel_values = self.image_processor(
                 frames, return_tensors="pt"
-            ).pixel_values
+            ).pixel_values  # shape: (1, num_frames, C, H, W)
+            # Rimuovi la dimensione batch extra restituita dall'image_processor
+            pixel_values = pixel_values.squeeze(0)  # shape: (num_frames, C, H, W)
+            # Trasponi per ottenere (C, num_frames, H, W)
+            pixel_values = pixel_values.permute(
+                1, 0, 2, 3
+            )  # shape: (C, num_frames, H, W)
+
+            logger.info(
+                f"Shape of pixel_values after processing: {pixel_values.shape}"
+            )  # Log della forma di pixel_values
 
             return {
                 "pixel_values": pixel_values,

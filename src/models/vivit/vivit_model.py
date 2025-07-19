@@ -10,6 +10,12 @@ def create_vivit_model(num_classes, model_name="google/vivit-b-16x2-kinetics400"
     Args:
         num_classes (int): Il numero di classi di output (es. 2 per 'positive' e 'negative').
         model_name (str): Il nome del modello pre-allenato da scaricare da Hugging Face.
+                          Analizziamo il nome 'google/vivit-b-16x2-kinetics400':
+                          - 'vivit': Sta per Video Vision Transformer, un'architettura basata su Transformer per l'analisi video.
+                          - '-b': Indica la versione "Base" del modello, un buon compromesso tra dimensioni e performance.
+                          - '16x2': Specifica la tokenizzazione del video. Il video è diviso in "tubelets" (cubi spazio-temporali)
+                            di 16x16 pixel nello spazio e 2 frame nel tempo.
+                          - 'kinetics400': È il dataset su cui il modello è stato pre-allenato, contenente 400 classi di azioni umane.
 
     Returns:
         tuple: Una tupla contenente il modello ViViT configurato e il suo image processor.

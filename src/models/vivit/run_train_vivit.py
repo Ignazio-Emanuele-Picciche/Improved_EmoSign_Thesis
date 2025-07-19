@@ -51,8 +51,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- Sezione 2: Definizione dei Percorsi Dati ---
-TRAIN_VIDEO_DIR = os.path.join(BASE_DIR, "data", "raw", "train")
-VAL_VIDEO_DIR = os.path.join(BASE_DIR, "data", "raw", "val")
+TRAIN_VIDEO_DIR = os.path.join(
+    BASE_DIR, "data", "raw", "train", "raw_videos_front_train"
+)
+VAL_VIDEO_DIR = os.path.join(BASE_DIR, "data", "raw", "val", "raw_videos_front_val")
 # Aggiorniamo i percorsi per puntare ai file CSV corretti.
 # Assumiamo che esista un file analogo per la validazione.
 # Se non esiste, andrebbe creato o il dataset di training andrebbe splittato.
@@ -93,7 +95,16 @@ def get_sampler(dataset):
 
 def prepare_batch(batch, device=None, non_blocking=False):
     """Sposta il batch di dati sul dispositivo corretto."""
+    logger.info(f"Batch before device transfer: {batch}")  # Log del batch originale
+    logger.info(
+        f"Pixel values shape before transfer: {batch['pixel_values'].shape}"
+    )  # Log della forma originale
+    logger.info(
+        f"Labels shape before transfer: {batch['labels'].shape}"
+    )  # Log della forma delle etichette
     pixel_values = batch["pixel_values"].to(device, non_blocking=non_blocking)
+    # Riordina le dimensioni da (batch, T, C, H, W) a (batch, C, T, H, W) per ViViT
+    pixel_values = pixel_values.permute(0, 2, 1, 3, 4)
     labels = batch["labels"].to(device, non_blocking=non_blocking)
     return pixel_values, labels
 
@@ -172,12 +183,25 @@ def main(args):
         def train_step(engine, batch):
             model.train()
             optimizer.zero_grad()
-            pixel_values, labels = prepare_batch(batch, device=device)
-            outputs = model(pixel_values=pixel_values, labels=labels)
-            loss = outputs.loss
-            loss.backward()
-            optimizer.step()
-            return loss.item()
+            try:
+                logger.info(
+                    f"\nBatch keys: {batch.keys()}"
+                )  # Log delle chiavi del batch
+                pixel_values, labels = prepare_batch(batch, device=device)
+                logger.info(
+                    f"\nShape of pixel_values: {pixel_values.shape}"
+                )  # Log della forma del tensore
+                logger.info(
+                    f"\nActual shape of pixel_values: {pixel_values.shape}"
+                )  # Log dettagliato della forma del tensore
+                outputs = model(pixel_values=pixel_values, labels=labels)
+                loss = outputs.loss
+                loss.backward()
+                optimizer.step()
+                return loss.item()
+            except Exception as e:
+                logger.error(f"\nError during train_step: {e}")
+                raise
 
         trainer = Engine(train_step)
 
